@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muvap"
+version = "0.1.0"
+description = "MuVAP: Multimodal Multiparty Voice Activity Projection for Turn-taking Prediction in the Wild"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "einops>=0.8",
+  "lightning>=2.5",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "scikit-learn>=1.5",
+  "soundfile>=0.12",
+  "torch>=2.6",
+  "torchaudio>=2.6",
+  "torchmetrics>=1.6",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# The Mimi frontend. CPC needs nothing beyond the base install.
+mimi = ["transformers>=4.45"]
+wandb = ["wandb>=0.19"]
+
+[tool.setuptools]
+# One entry point per module. VAP is the first; the others land here as they
+# are released, alongside the packages below, which they already share.
+py-modules = ["projection_window", "train_vap"]
+
+[tool.setuptools.packages.find]
+include = ["config*", "data*", "models*", "preprocess*", "tasks*", "tools*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

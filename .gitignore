@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.vscode/
+artifacts/
+lightning_logs/
+wandb/
+build/
+dist/
+*.ckpt
+
+# Frozen frontends are fetched from their own pretrained source at first use.
+models/assets/

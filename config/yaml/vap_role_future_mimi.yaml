@@ -1,0 +1,57 @@
+# Role-Future VAP on a frozen Mimi frontend.
+#
+# Identical to vap_role_future.yaml apart from the audio encoder, so a difference
+# between the two runs is attributable to the frontend.
+fisher_path: data/fisher
+checkpoint_dir: runs/vap_role_future_mimi
+
+vap:
+  arch: mono
+  # Frozen 37.8M Mimi encoder replaces the frozen 1.8M CPC one. Its 512-dim
+  # features are bridged onto d_model by the model's encoder projection.
+  audio_encoder:
+    name: mimi
+    tap: encoder            # 25 Hz, matching the label grid; `latent` is 12.5 Hz
+  batch_size: 64
+  num_workers: 16
+  max_epochs: 5
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.0001
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  matmul_precision: high
+  # Metric that selects best.ckpt. Leave empty when there is no held-out
+  # split to select on: last.ckpt is written either way.
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+  # npy reads the segments written by preprocessing; raw seeks the same window
+  # in the source recording and resamples it.
+  source: npy
+  swap_channels: false
+
+  projection_window:
+    bin_sec: [1.4, 0.6, 0.2, 0.4, 0.6, 0.8]
+    num_hist_bins: 2
+    frame_hz: 25
+    threshold: 0.5
+    mode: role_future
+    cut_center_frame: false
+
+  temporal:
+    d_model: 256
+    m_ff: 3
+    n_heads: 4
+    n_layers: 4
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: rope         # alibi | rope | sinusoidal | none
+    ffn: mlp
+    norm: layer
+    # Size of the sinusoidal position table. Rotary and ALiBi extend to any
+    # length, so this bounds the sinusoidal encoding only.
+    max_frames: 4096
