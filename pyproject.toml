@@ -13,6 +13,7 @@ dependencies = [
   "einops>=0.8",
   "lightning>=2.5",
   "numpy>=1.26",
+  "opencv-python-headless>=4.10",
   "pyyaml>=6.0",
   "scikit-learn>=1.5",
   "soundfile>=0.12",
@@ -28,9 +29,8 @@ mimi = ["transformers>=4.45"]
 wandb = ["wandb>=0.19"]
 
 [tool.setuptools]
-# One entry point per module. VAP is the first; the others land here as they
-# are released, alongside the packages below, which they already share.
-py-modules = ["projection_window", "train_vap"]
+# One entry point per module. They share the packages found below.
+py-modules = ["projection_window", "train_vap", "train_asd"]
 
 [tool.setuptools.packages.find]
 include = ["config*", "data*", "models*", "preprocess*", "tasks*", "tools*"]

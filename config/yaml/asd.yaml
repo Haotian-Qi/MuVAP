@@ -1,0 +1,109 @@
+checkpoint_dir: runs/asd
+
+evaluation:
+  # The official val_orig.csv, shipped inside the pack it scores.
+  ava_groundtruth: data/AVA/packed/val/groundtruth.csv
+  ava_predictions: runs/asd/ava_predictions.csv
+
+# Each corpus keeps its pack beside its own media, so a dataset can be copied
+# to fast local storage on its own. AVA val is disjoint from everything and is
+# the only evaluation set. Measured overlap at the source-video level:
+#
+#   AVA train / val              0 of 33 shared - a real held-out split
+#   WASD train / val           161 of 161 shared - never held out, free to train on
+#   MSDWild few.train / few.val  0 of 489 shared - a real held-out split
+#   MSDWild few.train / many.val 0 of 172 shared - a real held-out split
+#
+# WASD val and both MSDWild val sets are trained on deliberately. WASD val is
+# not a held-out set to begin with. The MSDWild pair are: training on them
+# spends two genuine evaluation sets (23.4 h, and 16.9 h of the harder
+# many-speaker condition) to buy 40 h of training data. AVA val is untouched
+# and is what the reported mAP is computed on. Move any of them back under
+# `val` to recover them as evaluation sets.
+packed_asd:
+  train:
+    - data/AVA/packed/train
+    - data/WASD/packed/train
+    - data/WASD/packed/val
+    - data/MSDWild/packed/few.train
+    - data/MSDWild/packed/few.val
+    - data/MSDWild/packed/many.val
+  val:
+    - data/AVA/packed/val
+
+asd:
+  num_workers: 16
+  max_epochs: 5
+  seed: 0
+
+  # Frozen audio frontend: cpc (256-dim) or mimi (512-dim, Kyutai). Both emit
+  # 25 Hz features, which is the rate the visual frontend runs at.
+  audio_encoder: cpc
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  matmul_precision: high
+  # Metric that selects best.ckpt. Leave empty when there is no held-out
+  # split to select on: last.ckpt is written either way.
+  checkpoint_monitor: val/mAP_official
+  checkpoint_mode: max
+
+  # Batches are built to a frame budget rather than a fixed batch size, and
+  # tracks longer than train_window are split into near-equal chunks so one
+  # epoch still covers every frame. Each chunk after the first also reads the
+  # projection window's history as unscored context, so a causal model never
+  # has to predict from history it was not shown. See docs/preprocessing.md.
+  train_window: 250
+  frame_budget: 2048
+  min_batch: 4
+  max_batch: 16
+
+  # Validation batches whole tracks, grouped by length and right-padded. It is
+  # forward-only, so it affords a much larger budget than training.
+  val_frame_budget: 8192
+  val_max_batch: 64
+
+  # Train-time augmentation. Audio mixing is the one that attacks false
+  # positives: foreign speech is added while the label stays unchanged, so the
+  # model has to reject speech it cannot see on the face. Donors are drawn from
+  # a different clip, never from the batch.
+  augment:
+    audio_mix_prob: 0.5
+    audio_snr_db: [-5.0, 5.0]
+    visual: true
+    crop_scale: [0.7, 1.0]
+    rotate_degrees: 15.0
+    # Ablation: replace the audio and relabel the sample silent. Off by default.
+    substitute_audio_prob: 0.0
+
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.00001
+
+  projection_window:
+    bin_sec: [0.8, 0.6, 0.4, 0.2, 0.2, 0.4]
+    num_hist_bins: 4
+    frame_hz: 25
+    threshold: 0.5
+    mode: independent
+    cut_center_frame: false
+
+  cross:
+    d_model: 256
+    m_ff: 4
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+
+  temporal:
+    d_model: 512
+    m_ff: 4
+    n_heads: 8
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none

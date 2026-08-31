@@ -33,9 +33,13 @@ def strip_prefix(state_dict, prefix=MODULE_PREFIX):
 
 
 def build_model(cfg, module):
+    if module == "asd":
+        from models.asd import AudioVisualASD
+
+        return AudioVisualASD(cfg["asd"])
     from models.vap import build_vap
 
-    return build_vap(cfg[module])
+    return build_vap(cfg["vap"])
 
 
 def frozen_keys(model):
@@ -46,7 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint")
     parser.add_argument("output", help="destination directory")
-    parser.add_argument("--module", choices=("vap",), default="vap")
+    parser.add_argument("--module", choices=("vap", "asd"), default="vap")
     parser.add_argument(
         "--keep-frozen",
         action="store_true",
