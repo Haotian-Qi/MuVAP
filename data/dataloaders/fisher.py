@@ -5,11 +5,16 @@ pre-encoded class indices. Labels are projected in the dataloader, so changing
 `projection_window.mode` between the role-based and original-VAP setups is a
 config edit rather than a re-run of preprocessing.
 
-Audio comes from one of two sources, selected by `vap.source`. `npy` reads the
-segments written under `seg/` and `tune/`; `raw` seeks the same span in the
-source recording and resamples it, which costs an order of magnitude less
-storage and leaves segment length, stride, and sample rate free to change
-without re-running preprocessing. The two yield the same window.
+Audio comes from one of two sources, selected by `vap.source`:
+
+* `npy` reads the pre-cut segments under `seg/` and `tune/`.
+* `raw` seeks the same span in the 8 kHz mu-law source recording and resamples
+  it. The source is 97 GB where the pre-cut segments are 1.12 TB, and segment
+  length, stride, and sample rate stop being baked into the files, so they can
+  change without re-running preprocessing.
+
+Both sources are required to yield the same window, and a test pins them to
+each other.
 """
 
 from functools import lru_cache
@@ -39,7 +44,8 @@ def _source_rate(path):
 def read_source_window(path, start_sec, duration_sec, channels):
     """Read `duration_sec` from a source recording, resampled to 16 kHz.
 
-    Fisher ships as 8 kHz mu-law NIST Sphere, which `soundfile` reads.
+    Fisher ships as 8 kHz mu-law NIST Sphere, which `soundfile` reads and
+    `torchaudio` (2.11) no longer does.
     """
     path = str(path)
     rate = _source_rate(path)
@@ -80,9 +86,16 @@ def _check_source(source):
 
 
 def _audio_spec(channels):
+    """Fisher segment spec.
+
+    Segments written by earlier revisions of `00_prep_fisher.py` stored float
+    PCM without clipping, and about one in eight overshoots [-1, 1] by up to
+    2.5 dB. Clipping them is what any encoder would do and keeps those shards
+    usable; freshly prepared segments are int16 and never reach this path.
+    """
     if channels not in (1, 2):
         raise ValueError(f"channels must be 1 or 2, got {channels}")
-    return AudioSpec(sample_rate=16_000, mono=channels == 1)
+    return AudioSpec(sample_rate=16_000, mono=channels == 1, clamp_to_peak=True)
 
 
 class Fisher(Dataset):
@@ -114,16 +127,22 @@ class Fisher(Dataset):
         self._build(split_path)
 
     def _paths(self, line):
-        # Resolved without touching the filesystem: a split lists hundreds of
-        # thousands of segments, and stat-ing each one costs minutes of startup.
+        # Paths are resolved without touching the filesystem: a split can list
+        # hundreds of thousands of segments on a network mount, and stat-ing
+        # each one at construction costs minutes before the first batch.
         part, group, conversation, segment, start, end, *_ = line.split()
-        seg = self.root / part / "seg"
-        if self.source == "npy":
-            audio = seg / "audio" / group / conversation / f"{segment}.npy"
-        else:
-            audio = self.root / part / "audio" / group / f"{conversation}.wav"
-        vad = seg / "vad" / group / conversation / f"{segment}.npy"
-        return audio, vad, float(start), float(end) - float(start)
+        base = self.root / part / "seg"
+        audio = (
+            base / "audio" / group / conversation / f"{segment}.npy"
+            if self.source == "npy"
+            else self.root / part / "audio" / group / f"{conversation}.wav"
+        )
+        return (
+            audio,
+            base / "vad" / group / conversation / f"{segment}.npy",
+            float(start),
+            float(end) - float(start),
+        )
 
     def _build(self, split_path):
         with open(split_path) as file:
@@ -184,57 +203,78 @@ class Fisher(Dataset):
 class FisherEvent(Dataset):
     """Ten-second clips ending at an annotated hold or shift decision point."""
 
-    FIELDS = (
-        "part", "group", "conversation", "start", "end",
-        "prev_spk", "next_spk", "timing", "gap_type", "label",
-    )
+    FIELDS = ("part", "group", "conversation", "start", "end", "prev_spk", "next_spk",
+              "timing", "gap_type", "label")
 
     def __init__(self, fisher_path, split_paths, channels=1, source="npy"):
-        self.root = Path(fisher_path)
+        root = Path(fisher_path)
         self.channels = channels
         self.source = _check_source(source)
         self.spec = _audio_spec(channels)
-        self.clip_dir = "audio" if channels == 1 else "audio_stereo"
+        self.audio_dir = "audio" if channels == 1 else "audio_stereo"
+        self.samples = []
         if isinstance(split_paths, (str, Path)):
             split_paths = [split_paths]
 
-        self.samples = []
         for split_path in split_paths:
             with open(split_path) as file:
                 for line in file:
                     if not line.strip():
                         continue
-                    sample = self._sample(dict(zip(self.FIELDS, line.split())))
-                    if sample is not None:
-                        self.samples.append(sample)
-
-    def _sample(self, event):
-        """One sample for this event, or None if it has no complete window."""
-        crop_start = 0.0
-        if self.source == "raw":
-            crop = event_crop(event["timing"], float(event["start"]), float(event["end"]))
-            if crop is None:
-                return None
-            crop_start = crop[0]
-            audio = self.root / event["part"] / "audio" / event["group"]
-            audio /= f"{event['conversation']}.wav"
-        else:
-            audio = self.root / event["part"] / "tune" / self.clip_dir / event["group"]
-            audio /= f"{event['conversation']}/{event['start']}.npy"
-
-        label = 1.0 if event["label"] == "SHIFT" else 0.0
-        return (
-            audio, label, event["conversation"], event["timing"],
-            event["gap_type"], int(event["prev_spk"]), crop_start,
-        )
+                    fields = dict(zip(self.FIELDS, line.split()))
+                    if self.source == "raw":
+                        crop = event_crop(
+                            fields["timing"],
+                            float(fields["start"]),
+                            float(fields["end"]),
+                        )
+                        if crop is None:
+                            continue
+                        audio_path = (
+                            root
+                            / fields["part"]
+                            / "audio"
+                            / fields["group"]
+                            / f"{fields['conversation']}.wav"
+                        )
+                        crop_start = crop[0]
+                    else:
+                        audio_path = (
+                            root
+                            / fields["part"]
+                            / "tune"
+                            / self.audio_dir
+                            / fields["group"]
+                            / fields["conversation"]
+                            / f"{fields['start']}.npy"
+                        )
+                        crop_start = 0.0
+                    self.samples.append(
+                        (
+                            audio_path,
+                            1.0 if fields["label"] == "SHIFT" else 0.0,
+                            fields["conversation"],
+                            fields["timing"],
+                            fields["gap_type"],
+                            int(fields["prev_spk"]),
+                            crop_start,
+                        )
+                    )
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        audio_path, label, conversation, timing, gap_type, prev_spk, crop_start = (
-            self.samples[index]
-        )
+        (
+            audio_path,
+            label,
+            conversation,
+            timing,
+            gap_type,
+            prev_spk,
+            crop_start,
+        ) = self.samples[index]
+
         if self.source == "raw":
             audio = read_source_window(
                 audio_path, crop_start, EVENT_SEG_LEN_SEC, self.channels
@@ -243,8 +283,8 @@ class FisherEvent(Dataset):
             audio, _ = load_waveform(audio_path, self.spec, npy_sample_rate=16_000)
             if self.channels == 2 and audio.shape[0] != 2:
                 raise ValueError(
-                    f"{audio_path} holds {audio.shape[0]} channel(s); stereo evaluation "
-                    "needs 2. Re-run preprocess/vap/02_prep_event.py with --channels 2, "
+                    f"{audio_path} holds {audio.shape[0]} channel(s); stereo evaluation needs 2. "
+                    "Re-run preprocess/vap/02_prep_event.py with --channels 2, "
                     "or set vap.source: raw to read the source recording instead"
                 )
         return audio, label, conversation, timing, gap_type, prev_spk

@@ -42,8 +42,6 @@ the setup rather than from a different pipeline.
 | Configuration | Config | Input | Frontend | Codebook |
 | --- | --- | --- | --- | --- |
 | Role-based | `config/yaml/vap.yaml` | 1 mixed channel | CPC | 136 role-relative classes |
-| Role-future | `config/yaml/vap_role_future.yaml` | 1 mixed channel | CPC | 136 role classes, four future bins |
-| Role-future + Mimi | `config/yaml/vap_role_future_mimi.yaml` | 1 mixed channel | Mimi | as above |
 | Original VAP | `config/yaml/vap_original.yaml` | 2 channels, one per speaker | CPC | 256 classes, one channel per row |
 
 ```bash
@@ -141,9 +139,36 @@ Both are causal, which is what makes the model usable as a streaming predictor.
 
 ## Weight releases
 
-Trained weights are not published here yet; they follow once the modules they
-belong to are all in. What is here is the format they will arrive in, and the
-code that reads it.
+Trained weights live on the Hub at
+[Haotian-Qi/MuVAP](https://huggingface.co/Haotian-Qi/MuVAP).
+
+| Release | Module | Frontend | Score |
+| --- | --- | --- | --- |
+| `vap-speaker-cpc` | VAP | CPC | f1_macro 0.7310 |
+| `vap-role-cpc` | VAP | CPC | f1_macro 0.7289 |
+| `vap-role-mimi` | VAP | Mimi | f1_macro 0.7589 |
+| `asd-cpc` | ASD | CPC | mAP_official 90.4983 |
+| `asd-mimi` | ASD | Mimi | mAP_official 92.0429 |
+
+`f1_macro` is zero-shot hold/shift on the Fisher events, at the shift prior each
+codebook defaults to - 2.0 for the role releases, 1.0 for `vap-speaker-cpc`,
+whose rows name channels. `mAP_official` is the AVA-ActiveSpeaker mAP.
+
+Fetch one, then evaluate it:
+
+```bash
+huggingface-cli download Haotian-Qi/MuVAP --include 'vap-role-mimi/*' --local-dir weights
+
+python train_vap.py --config config/yaml/vap.yaml \
+    --test --weights weights/vap-role-mimi \
+    --set fisher_path=/path/to/fisher
+```
+
+That reproduces the score in the table exactly. All five at once:
+
+```bash
+huggingface-cli download Haotian-Qi/MuVAP --local-dir weights
+```
 
 A run produces two checkpoints. `last.ckpt` is the final epoch — the artifact
 the run committed to. `best.ckpt` is the epoch a validation metric picked, and

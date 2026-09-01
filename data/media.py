@@ -19,6 +19,10 @@ class AudioSpec:
     sample_rate: int = 16_000
     mono: bool = True
     peak_limit: float = 1.0 + 1e-4
+    # Out-of-range float PCM is a scaling bug in most corpora, so it raises by
+    # default. Set this only for a source known to store real audio that
+    # overshoots, where clipping is the same thing any encoder would do.
+    clamp_to_peak: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,7 @@ def _integer_audio_to_float(array: np.ndarray) -> np.ndarray:
 
 
 def _channels_first(array: np.ndarray) -> np.ndarray:
-    """Canonicalize `[N]`, `[C,N]`, and `[N,C]` layouts to `[C,N]`."""
+    """Canonicalize common `[N]`, `[C,N]`, and legacy `[N,C]` layouts."""
     if array.ndim == 1:
         return array[None, :]
     if array.ndim != 2:
@@ -70,10 +74,12 @@ def canonicalize_waveform(
     if not torch.isfinite(waveform).all():
         raise ValueError("audio contains NaN or infinite values")
     if waveform.numel() and waveform.abs().max().item() > spec.peak_limit:
-        raise ValueError(
-            "floating-point audio exceeds [-1, 1]; convert integer PCM to normalized "
-            "float during preprocessing instead of applying per-clip normalization"
-        )
+        if not spec.clamp_to_peak:
+            raise ValueError(
+                "floating-point audio exceeds [-1, 1]; convert integer PCM to normalized "
+                "float during preprocessing instead of applying per-clip normalization"
+            )
+        waveform = waveform.clamp(-1.0, 1.0)
     if spec.mono and waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     return waveform.contiguous()

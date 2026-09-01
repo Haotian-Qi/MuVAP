@@ -4,8 +4,8 @@ Two architectures share one head contract: a `[batch, frames, classes]` logit
 stream over whatever codebook the configured `ProjectionWindow` defines.
 
 * `AudioVAP` reads one mixed-mono channel. Speaker identity is not given to
-  the model, so it only works with a role-based codebook (`role_relative`,
-  `role_future`), which names speakers by their role in the conversation.
+  the model, so it only works with the `role_relative` codebook, which names
+  speakers by their role in the conversation.
 * `StereoVAP` reproduces the original VAP model: one channel per speaker,
   a shared encoder and self-attention stack, cross-attention between the two
   channels, and one head over their concatenation. Channels are ordered, so it

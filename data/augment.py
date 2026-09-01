@@ -8,10 +8,11 @@ per-frame jitter would destroy the motion it reads.
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
 
 VISUAL_MODES = ("orig", "flip", "crop", "rotate")
 

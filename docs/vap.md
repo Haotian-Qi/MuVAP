@@ -10,12 +10,10 @@ than from a different pipeline.
 | --- | --- | --- | --- | --- | --- |
 | Original VAP | `vap_original.yaml` | CPC | 2 (one per speaker) | `speaker_based` | 256 |
 | Role-based | `vap.yaml` | CPC | 1 (downmix) | `role_relative` | 136 |
-| Role-future | `vap_role_future.yaml` | CPC | 1 (downmix) | `role_future` | 136 |
-| Role-future + Mimi | `vap_role_future_mimi.yaml` | Mimi | 1 (downmix) | `role_future` | 136 |
 
-Hold and shift come from the logits for `role_relative` (roles are named by the
-class) and for `speaker_based` (channels are, given `prev_spk`); `role_future`
-does not preserve current-speaker identity, so it is scored by embedding probe.
+Hold and shift come from the logits in both setups: `role_relative` names the
+roles in the class, and `speaker_based` names the channels, which needs
+`prev_spk` to say which one held the floor.
 
 ## What each setup is
 
@@ -24,13 +22,6 @@ so the model is never told who is who. The class names the *roles* - current
 speaker and next speaker - through an order-invariant pair codebook over two
 history and two future bins. Hold and shift fall straight out of the logits
 because the class already says which role continues.
-
-**Role-Future** keeps the role-based history but splits the future into four
-bins per role, at the same resolution the original VAP uses. It answers *when*
-as well as *who*. The trade-off is that the class no longer preserves
-current-speaker identity, so hold/shift cannot be decoded from the logits;
-`ProjectionWindow.get_shift_hold` refuses, and the task scores this setup with a
-logistic probe fitted on the last-frame embedding instead.
 
 **Original VAP** reproduces Ekstedt & Skantze (2022): one audio channel per
 speaker, a shared encoder and causal self-attention stack applied to each
@@ -167,9 +158,6 @@ python train_vap.py --config config/yaml/vap.yaml --name rolebased_alibi
 python train_vap.py --config config/yaml/vap.yaml --name rolebased_rope \
   --set vap.temporal.pos_encoding=rope
 
-# Role-Future
-python train_vap.py --config config/yaml/vap_role_future.yaml --name rolefuture_rope
-
 # Original VAP, two channels
 python train_vap.py --config config/yaml/vap_original.yaml --name originalvap
 ```
@@ -188,11 +176,17 @@ key the config does not already define, so a typo cannot silently do nothing.
 ## Metrics
 
 `trainer.test` runs two dataloaders: the tune events fit the linear probe, the
-test events score it. Events are pooled by `timing` (`SILENT` / `ACTIVE`) and by
-`timing_gaptype` (`SILENT_SHORT`, `ACTIVE_LONG`, ...), and each pool logs:
+test events are scored. Events are pooled three ways - `all`, `SILENT`,
+`ACTIVE` - and three prefixes keep the panels apart:
 
-- `test/<pool>/f1_scale_<s>` - macro F1 at each shift prior `s` in 1.0 ... 3.0
-  (role-based and original-VAP setups only)
-- `test/<pool>/f1_best`, `test/<pool>/bacc_best` - the best of that sweep
-- `test/<pool>/probe_f1` - macro F1 of a logistic probe on the last-frame
-  embedding, available for every setup including Role-Future
+- `test/<pool>/f1_macro`, `test/<pool>/bacc` - the headline. Hold and shift are
+  decoded from the logits, zero shot, over `p_future` at the shift prior the
+  codebook defaults to: 2.0 for `role_relative`, 1.0 for `speaker_based`, whose
+  rows name channels and so also need the event's `prev_spk`.
+- `probe/<pool>/f1_macro`, `probe/<pool>/bacc` - a logistic probe on the
+  last-frame embedding. It bypasses the codebook, so the gap against `test/`
+  is what the readout costs rather than anything about the model. Being fitted,
+  it is a diagnostic and not a score.
+- `ablation/<pool>/f1_macro_scale_<s>` - the shift prior swept 1.0 ... 3.0, the
+  way the VAP papers report it. `speaker_based` gains about 0.045 from a prior
+  of 2.0; the role setups are already at their optimum and gain 0.001.

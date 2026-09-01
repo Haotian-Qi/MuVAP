@@ -1,6 +1,5 @@
 import torch
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -13,17 +12,17 @@ class LogisticProber:
             C=1.0, class_weight="balanced", max_iter=1000, random_state=42
         )
 
-    def fit_and_score(self, X_train, y_train, X_test, y_test):
-        if len(y_train) < 10 or len(y_test) < 10:
-            return 0.0
+    def fit_predict(self, X_train, y_train, X_test):
+        """Predictions on the test events, or None if either pool is too small.
 
-        X_train_s = self.scaler.fit_transform(X_train)
-        X_test_s = self.scaler.transform(X_test)
+        Returning the predictions rather than one score lets the caller report
+        the probe with the same metrics as the zero-shot readout.
+        """
+        if len(y_train) < 10 or len(X_test) < 10:
+            return None
 
-        self.clf.fit(X_train_s, y_train)
-        y_pred = self.clf.predict(X_test_s)
-
-        return f1_score(y_test, y_pred, average="macro")
+        self.clf.fit(self.scaler.fit_transform(X_train), y_train)
+        return self.clf.predict(self.scaler.transform(X_test))
 
 
 def get_param_groups(named_parameters, weight_decay):

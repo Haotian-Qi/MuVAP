@@ -80,11 +80,23 @@ def main():
         dropped = frozen_keys(model) & set(weights)
         weights = {k: v for k, v in weights.items() if k not in dropped}
 
+    # A checkpoint can also carry buffers this build does not register - ALiBi
+    # slopes, say, which are recomputed from the head count. They are not trained
+    # state, and shipping them makes `load_weights` reject the release, so drop
+    # them; the `missing` check below still proves nothing needed was lost.
+    recomputed = sorted(set(weights) - set(model.state_dict()))
+    weights = {k: v for k, v in weights.items() if k not in set(recomputed)}
+
     # Loading into a freshly built model proves the export is usable: the frozen
     # frontend arrives from its own pretrained source, everything else from here.
     missing, _ = model.load_state_dict(weights, strict=False)
     if set(missing) - dropped:
         raise SystemExit(f"weights missing from the export: {sorted(set(missing) - dropped)[:5]}")
+    if recomputed:
+        print(
+            f"dropped {len(recomputed)} buffer(s) the model recomputes: "
+            f"{', '.join(recomputed[:3])}{' ...' if len(recomputed) > 3 else ''}"
+        )
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -96,11 +108,17 @@ def main():
         {},
     )
     score = selection.get("best_model_score")
+    epoch = checkpoint.get("epoch")
+    max_epochs = cfg[args.module].get("max_epochs")
     provenance = {
         "module": args.module,
         "selected_on": selection.get("monitor"),
         "selected_score": float(score) if score is not None else None,
-        "epoch": checkpoint.get("epoch"),
+        "epoch": epoch,
+        "epochs_planned": max_epochs,
+        # Whether these are the weights training ended on. A checkpoint chosen
+        # by a validation metric need not be, and a release should say so.
+        "final_epoch": None if (epoch is None or not max_epochs) else epoch == max_epochs - 1,
         "global_step": checkpoint.get("global_step"),
         "lightning_version": checkpoint.get("pytorch-lightning_version"),
         "parameters": sum(v.numel() for v in weights.values()),

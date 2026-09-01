@@ -44,8 +44,6 @@ class VAPDataModule(LightningDataModule):
             self.val_dataset = self._segments("val")
 
         if stage in ("test", None):
-            # The probe is fitted on held-out events and scored on the test events,
-            # so the two sets must never share a conversation group.
             self.tune_dataset = FisherEvent(
                 self.root,
                 self._event_splits(["train", "val"]),
