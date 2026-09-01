@@ -2,7 +2,7 @@
 
 Class labels are *not* baked in here. Each segment stores the two-speaker VAD
 padded with `--context-sec` of extra frames on both sides, which is everything
-`ProjectionWindow` needs to produce role-based or original-VAP labels in the
+`ProjectionWindow` needs to produce role-based or speaker-based labels in the
 dataloader. Switching projection setups therefore never requires re-running
 this script.
 """
@@ -132,7 +132,7 @@ def process_entry(
     if not os.path.exists(audio_path):
         return []
 
-    # Both channels are kept: the original-VAP setup needs one per speaker and
+    # Both channels are kept: the speaker-based setup needs one per speaker and
     # the mono setups downmix in the dataloader.
     audio_tensor, duration = load_audio(audio_path, mono=False)
     audio = audio_tensor.numpy()
@@ -177,7 +177,7 @@ def run_pipeline(cfg: ProcessConfig, context_frames: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config/yaml/vap.yaml")
+    parser.add_argument("--config", default="config/yaml/vap_role.yaml")
     parser.add_argument(
         "--context-sec",
         type=float,

@@ -8,8 +8,8 @@ than from a different pipeline.
 
 | Experiment | Config | Frontend | Channels | `mode` | Classes |
 | --- | --- | --- | --- | --- | --- |
-| Original VAP | `vap_original.yaml` | CPC | 2 (one per speaker) | `speaker_based` | 256 |
-| Role-based | `vap.yaml` | CPC | 1 (downmix) | `role_relative` | 136 |
+| Speaker-based VAP | `vap_speaker.yaml` | CPC | 2 (one per speaker) | `speaker_based` | 256 |
+| Role-based VAP | `vap_role.yaml` | CPC | 1 (downmix) | `role_relative` | 136 |
 
 Hold and shift come from the logits in both setups: `role_relative` names the
 roles in the class, and `speaker_based` names the channels, which needs
@@ -23,7 +23,7 @@ speaker and next speaker - through an order-invariant pair codebook over two
 history and two future bins. Hold and shift fall straight out of the logits
 because the class already says which role continues.
 
-**Original VAP** reproduces Ekstedt & Skantze (2022): one audio channel per
+**Speaker-based VAP** reproduces Ekstedt & Skantze (2022): one audio channel per
 speaker, a shared encoder and causal self-attention stack applied to each
 channel, cross-attention between the two channels, and one head over their
 concatenation. The projection window works per channel - one channel per row of
@@ -85,7 +85,7 @@ the same stack.
 Switch encoding without editing the file:
 
 ```bash
-python train_vap.py --config config/yaml/vap.yaml --set vap.temporal.pos_encoding=rope
+python train_vap.py --config config/yaml/vap_role.yaml --set vap.temporal.pos_encoding=rope
 ```
 
 ## Data
@@ -125,19 +125,19 @@ not a re-run of preprocessing.
 Build the tree:
 
 ```bash
-python preprocess/vap/00_prep_fisher.py --config config/yaml/vap.yaml   # segments + VAD
-python preprocess/vap/01_create_event.py --config config/yaml/vap.yaml  # turn events
-python preprocess/vap/02_prep_event.py --config config/yaml/vap.yaml    # mono event clips
+python preprocess/vap/00_prep_fisher.py --config config/yaml/vap_role.yaml   # segments + VAD
+python preprocess/vap/01_create_event.py --config config/yaml/vap_role.yaml  # turn events
+python preprocess/vap/02_prep_event.py --config config/yaml/vap_role.yaml    # mono event clips
 ```
 
-The original-VAP setup evaluates on two-channel clips. `config/yaml/vap_original.yaml`
+The speaker-based setup evaluates on two-channel clips. `config/yaml/vap_speaker.yaml`
 ships with `source: raw`, which reads them straight from the source recording,
 so nothing more is needed. To evaluate it from pre-cut clips instead, write a
 two-channel copy - it lands in `tune/audio_stereo`, leaving the mono clips
 untouched - and set `source: npy`:
 
 ```bash
-python preprocess/vap/02_prep_event.py --config config/yaml/vap.yaml --channels 2
+python preprocess/vap/02_prep_event.py --config config/yaml/vap_role.yaml --channels 2
 ```
 
 `--splits` defaults to `val test`, which is what evaluation reads. Adding
@@ -152,20 +152,20 @@ three setups shipped here.
 
 ```bash
 # Role-Based, the default
-python train_vap.py --config config/yaml/vap.yaml --name rolebased_alibi
+python train_vap.py --config config/yaml/vap_role.yaml --name role_alibi
 
 # Role-Based with causal RoPE
-python train_vap.py --config config/yaml/vap.yaml --name rolebased_rope \
+python train_vap.py --config config/yaml/vap_role.yaml --name role_rope \
   --set vap.temporal.pos_encoding=rope
 
-# Original VAP, two channels
-python train_vap.py --config config/yaml/vap_original.yaml --name originalvap
+# Speaker-based VAP, two channels
+python train_vap.py --config config/yaml/vap_speaker.yaml --name speaker
 ```
 
 Evaluate a checkpoint without training:
 
 ```bash
-python train_vap.py --config config/yaml/vap.yaml --test --checkpoint runs/vap/rolebased_alibi/best.ckpt
+python train_vap.py --config config/yaml/vap_role.yaml --test --checkpoint runs/vap_role/role_alibi/best.ckpt
 ```
 
 Add `--wandb` for tracking, `--seed` to change the seed, and `--name` to choose

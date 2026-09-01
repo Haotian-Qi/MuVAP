@@ -187,7 +187,7 @@ def run_pipeline(cfg: ProcessConfig, channels: int = 1):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config/yaml/vap.yaml")
+    parser.add_argument("--config", default="config/yaml/vap_role.yaml")
     parser.add_argument(
         "--splits",
         nargs="+",

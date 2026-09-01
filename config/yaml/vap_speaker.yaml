@@ -1,7 +1,7 @@
-# Original VAP (Ekstedt & Skantze, 2022): two audio channels, one speaker per
+# Speaker-based VAP (Ekstedt & Skantze, 2022): two audio channels, one speaker per
 # channel, and a 256-class codebook that projects one channel per row.
 fisher_path: data/fisher
-checkpoint_dir: runs/vap_original
+checkpoint_dir: runs/vap_speaker
 
 vap:
   arch: stereo

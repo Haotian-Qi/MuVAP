@@ -19,7 +19,7 @@ from tasks.vap_task import VAPTask
 def parse_args():
     parser = argparse.ArgumentParser(description="Train or evaluate VAP")
     parser.add_argument(
-        "--config", default=Path(__file__).resolve().parent / "config/yaml/vap.yaml"
+        "--config", default=Path(__file__).resolve().parent / "config/yaml/vap_role.yaml"
     )
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--checkpoint", help="Lightning .ckpt to resume or evaluate")

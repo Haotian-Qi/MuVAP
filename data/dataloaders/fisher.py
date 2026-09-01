@@ -2,7 +2,7 @@
 
 Segments are stored as stereo audio beside the raw two-speaker VAD, not as
 pre-encoded class indices. Labels are projected in the dataloader, so changing
-`projection_window.mode` between the role-based and original-VAP setups is a
+`projection_window.mode` between the role-based and speaker-based setups is a
 config edit rather than a re-run of preprocessing.
 
 Audio comes from one of two sources, selected by `vap.source`:

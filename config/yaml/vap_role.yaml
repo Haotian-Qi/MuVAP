@@ -1,6 +1,6 @@
 # Role-based VAP: one mixed channel, 136 role-relative classes.
 fisher_path: data/fisher
-checkpoint_dir: runs/vap
+checkpoint_dir: runs/vap_role
 
 vap:
   arch: mono                 # mono | stereo

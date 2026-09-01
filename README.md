@@ -41,11 +41,11 @@ the setup rather than from a different pipeline.
 
 | Configuration | Config | Input | Frontend | Codebook |
 | --- | --- | --- | --- | --- |
-| Role-based | `config/yaml/vap.yaml` | 1 mixed channel | CPC | 136 role-relative classes |
-| Original VAP | `config/yaml/vap_original.yaml` | 2 channels, one per speaker | CPC | 256 classes, one channel per row |
+| Role-based VAP | `config/yaml/vap_role.yaml` | 1 mixed channel | CPC | 136 role-relative classes |
+| Speaker-based VAP | `config/yaml/vap_speaker.yaml` | 2 channels, one per speaker | CPC | 256 classes, one channel per row |
 
 ```bash
-python train_vap.py --config config/yaml/vap.yaml --name rolebased
+python train_vap.py --config config/yaml/vap_role.yaml --name role
 ```
 
 ### Positional encoding
@@ -117,7 +117,7 @@ run directory.
 on, and the final epoch is the only artifact the run keeps:
 
 ```bash
-python train_vap.py --config config/yaml/vap.yaml --set vap.checkpoint_monitor=
+python train_vap.py --config config/yaml/vap_role.yaml --set vap.checkpoint_monitor=
 ```
 
 `--test` then falls back to `last` instead of `best`. See
@@ -159,7 +159,7 @@ Fetch one, then evaluate it:
 ```bash
 huggingface-cli download Haotian-Qi/MuVAP --include 'vap-role-mimi/*' --local-dir weights
 
-python train_vap.py --config config/yaml/vap.yaml \
+python train_vap.py --config config/yaml/vap_role.yaml \
     --test --weights weights/vap-role-mimi \
     --set fisher_path=/path/to/fisher
 ```
@@ -188,7 +188,7 @@ the model is built. It ships `config.yaml` (the architecture) and
 checkpoint scored. Point `--weights` at a release directory to evaluate it:
 
 ```bash
-python train_vap.py --config config/yaml/vap.yaml --test --weights <release>
+python train_vap.py --config config/yaml/vap_role.yaml --test --weights <release>
 ```
 
 The architecture comes from the release's own `config.yaml`; dataset roots and

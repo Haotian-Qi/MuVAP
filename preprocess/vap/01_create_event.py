@@ -263,6 +263,6 @@ def run_pipeline(fisher_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create Fisher turn events")
-    parser.add_argument("--config", default="config/yaml/vap.yaml")
+    parser.add_argument("--config", default="config/yaml/vap_role.yaml")
     args = parser.parse_args()
     run_pipeline(init_yaml_config(args.config)["fisher_path"])
