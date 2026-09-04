@@ -35,14 +35,20 @@ python tools/fetch_frontends.py          # or: fetch_frontends.py cpc
 ## VAP
 
 Voice Activity Projection: a causal model that predicts who will hold the floor
-next, from audio alone. Four configurations share one training program and
-differ only in the config file, so a result difference between them comes from
+next, from audio alone. Every configuration shares one training program and
+differs only in the config file, so a result difference between them comes from
 the setup rather than from a different pipeline.
 
-| Configuration | Config | Input | Frontend | Codebook |
-| --- | --- | --- | --- | --- |
-| Role-based VAP | `config/yaml/vap_role.yaml` | 1 mixed channel | CPC | 136 role-relative classes |
-| Speaker-based VAP | `config/yaml/vap_speaker.yaml` | 2 channels, one per speaker | CPC | 256 classes, one channel per row |
+| Configuration | Config | Input | Codebook |
+| --- | --- | --- | --- |
+| Role-based VAP | `config/yaml/vap_role.yaml` | 1 mixed channel | 136 role-relative classes |
+| Speaker-based VAP | `config/yaml/vap_speaker.yaml` | 2 channels, one per speaker | 256 classes, one channel per row |
+| Speaker-based, mono | `config/yaml/vap_speaker_mono_mimi.yaml` | 1 mixed channel + VAD | 256 classes, one channel per row |
+
+The mono setup is the original VAP arrangement: one channel carries the audio
+and the causal voice activity behind each frame supplies the speaker identity a
+second channel would have carried. `config/yaml/` also holds the frontend and
+frame-rate variants of each - `*_mimi_12hz`, `*_cpc_50hz`.
 
 ```bash
 python train_vap.py --config config/yaml/vap_role.yaml --name role
@@ -144,14 +150,19 @@ python train_vap.py --config config/yaml/vap_role.yaml --set vap.checkpoint_moni
 
 ## Audio frontends
 
-`vap.audio_encoder` selects the frozen frontend. Both emit 25 Hz features, which
-is the rate the projection window labels, so they are drop-in alternatives.
+`vap.audio_encoder` selects the frozen frontend. Both emit features at the rate
+the projection window labels, so they are drop-in alternatives at a shared rate.
 
 | | `cpc` (default) | `mimi` |
 | --- | --- | --- |
 | Weights | CPC, LibriLight 60k | `kyutai/mimi`, from Moshi |
 | Frozen params | 1.8M | 37.8M |
 | Feature dim | 256 | 512 |
+| Frame rates | 100 / 50 / 25 / 12.5 | 25 / 12.5 |
+
+CPC halves a 100 Hz convolutional stack down to the requested rate; Mimi taps
+either its 25 Hz encoder output or its 12.5 Hz latent, so 50 Hz is a CPC-only
+option.
 
 Both are causal, which is what makes the model usable as a streaming predictor.
 
@@ -161,18 +172,10 @@ Both are causal, which is what makes the model usable as a streaming predictor.
 Trained weights live on the Hub at
 [Haotian-Qi/MuVAP](https://huggingface.co/Haotian-Qi/MuVAP).
 
-| Release | Module | Frontend | Score |
-| --- | --- | --- | --- |
-| `vap-speaker-cpc` | VAP | CPC | f1_macro 0.7310 |
-| `vap-speaker-mimi` | VAP | Mimi | f1_macro 0.7755 |
-| `vap-role-cpc` | VAP | CPC | f1_macro 0.7289 |
-| `vap-role-mimi` | VAP | Mimi | f1_macro 0.7589 |
-| `asd-cpc` | ASD | CPC | mAP_official 90.4983 |
-| `asd-mimi` | ASD | Mimi | mAP_official 92.0429 |
-
-`f1_macro` is zero-shot hold/shift on the Fisher events, at the shift prior each
-codebook defaults to - 2.0 for the role releases, 1.0 for `vap-speaker-cpc`,
-whose rows name channels. `mAP_official` is the AVA-ActiveSpeaker mAP.
+Two ASD releases, `asd-cpc` and `asd-mimi`, scoring 90.50 and 92.04
+`mAP_official` on AVA-ActiveSpeaker. The VAP releases span three codebooks, two
+frontends and three frame rates - [docs/vap.md](docs/vap.md#released-models)
+lists them with their scores.
 
 Fetch one, then evaluate it:
 
@@ -184,7 +187,7 @@ python train_vap.py --config config/yaml/vap_role.yaml \
     --set fisher_path=/path/to/fisher
 ```
 
-That reproduces the score in the table exactly. All five at once:
+That reproduces the score in the table exactly. All of them at once:
 
 ```bash
 huggingface-cli download Haotian-Qi/MuVAP --local-dir weights
@@ -226,5 +229,5 @@ from models.vap import build_vap
 weights, config = resolve("path/to/release")
 cfg = yaml.safe_load(open(config))["vap"]
 model = load_weights(build_vap(cfg), weights).eval()
-logits = model(waveform)          # [batch, frames, classes] at 25 Hz
+logits = model(waveform)          # [batch, frames, classes] at the release's rate
 ```

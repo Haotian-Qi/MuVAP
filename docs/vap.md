@@ -173,6 +173,46 @@ the checkpoint directory. `--set KEY=VALUE` overrides any existing config key
 (dotted path, value parsed as YAML) and can be repeated; it fails loudly on a
 key the config does not already define, so a typo cannot silently do nothing.
 
+## Released models
+
+Weights are on the Hub at [Haotian-Qi/MuVAP](https://huggingface.co/Haotian-Qi/MuVAP).
+`f1_macro` is zero-shot hold/shift on the Fisher events, decoded from the logits
+over `p_future`, at the shift prior each codebook defaults to.
+
+| Release | Codebook | Audio in | Rate | Frontend | f1_macro | bacc | probe f1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `vap-speaker-mimi-12hz` | speaker, 256 | 2 ch | 12.5 | Mimi | **0.7776** | 0.7495 | 0.7714 |
+| `vap-speaker-mimi` | speaker, 256 | 2 ch | 25 | Mimi | 0.7755 | 0.7464 | 0.7716 |
+| `vap-role-mimi` | role, 136 | 1 ch | 25 | Mimi | 0.7589 | 0.7698 | 0.7623 |
+| `vap-role-mimi-12hz` | role, 136 | 1 ch | 12.5 | Mimi | 0.7565 | 0.7663 | 0.7570 |
+| `vap-speaker-mono-mimi` | speaker, 256 | 1 ch + VAD | 25 | Mimi | 0.7517 | 0.7216 | 0.7619 |
+| `vap-speaker-mono-mimi-12hz` | speaker, 256 | 1 ch + VAD | 12.5 | Mimi | 0.7484 | 0.7183 | 0.7585 |
+| `vap-speaker-cpc-50hz` | speaker, 256 | 2 ch | 50 | CPC | 0.7444 | 0.7129 | 0.7520 |
+| `vap-role-cpc-50hz` | role, 136 | 1 ch | 50 | CPC | 0.7358 | 0.7378 | 0.7382 |
+| `vap-speaker-cpc` | speaker, 256 | 2 ch | 25 | CPC | 0.7310 | 0.6983 | 0.7508 |
+| `vap-role-cpc` | role, 136 | 1 ch | 25 | CPC | 0.7289 | 0.7303 | 0.7304 |
+| `vap-speaker-mono-cpc-50hz` | speaker, 256 | 1 ch + VAD | 50 | CPC | 0.7148 | 0.6823 | 0.7398 |
+
+Read it with three cautions.
+
+**The prior is a threshold, and it differs by codebook.** Scaling the shift slot
+by `s` and renormalising is exactly a decision threshold at `1/(1+s)`, so the
+speaker rows sit at 0.5 and the role rows at 0.333. The `bacc` column is where
+that shows. Comparisons within a codebook are sound; across codebooks they are
+comparing operating points as much as models. `probe f1`, a logistic probe on
+the last-frame embedding, is threshold-free and closer to like-for-like.
+
+**The frontend is the only large effect.** Mimi over CPC is +0.045 on speaker and
++0.030 on role at matched rate. Frame rate is 3-6x smaller: 25 -> 50 Hz on CPC
+gains 0.013 (speaker) and 0.007 (role), and on Mimi 25 -> 12.5 Hz costs nothing
+measurable - +0.002, -0.002, -0.003 across the three codebooks. Matching a
+12.5 Hz downstream system is therefore close to free.
+
+**The `-mono-` releases need VAD at inference.** They take one mixed channel plus
+the voice activity behind each frame, `model(audio, vad)`, which is what supplies
+the speaker identity a second channel would carry. Quality depends on the VAD you
+feed them.
+
 ## Metrics
 
 `trainer.test` runs two dataloaders: the tune events fit the linear probe, the

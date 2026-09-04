@@ -51,6 +51,7 @@ class VAPDataModule(LightningDataModule):
                 channels=self.channels,
                 source=self.source,
                 with_vad=self.with_vad,
+                frame_hz=self.projection.frame_hz,
             )
             self.test_dataset = FisherEvent(
                 self.root,
@@ -58,6 +59,7 @@ class VAPDataModule(LightningDataModule):
                 channels=self.channels,
                 source=self.source,
                 with_vad=self.with_vad,
+                frame_hz=self.projection.frame_hz,
             )
 
     def _segments(self, name, swap=False):

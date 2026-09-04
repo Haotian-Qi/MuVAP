@@ -32,6 +32,18 @@ from preprocess.vap.utils import EVENT_SEG_LEN_SEC, event_crop
 
 SOURCES = ("npy", "raw")
 VAD_HZ = 25
+
+
+def vad_dirname(frame_hz):
+    """Where the VAD for this rate lives: `vad` at 25 Hz, `vad12_5` at 12.5, ...
+
+    `00_prep_fisher.py` writes the 25 Hz labels to `seg/vad`; every other rate is
+    written beside it by `03_prep_vad_rate.py`, so the original tree is never
+    overwritten and two rates can coexist.
+    """
+    if float(frame_hz) == float(VAD_HZ):
+        return "vad"
+    return "vad" + f"{float(frame_hz):g}".replace(".", "_")
 TARGET_SAMPLE_RATE = 16_000
 # Resampling a slice is not the same as slicing a resampled recording: the
 # filter needs signal beyond both edges. Read this much extra and trim it off.
@@ -160,8 +172,12 @@ class Fisher(Dataset):
         self.channels = channels
         self.source = _check_source(source)
         self.spec = _audio_spec(channels)
-        self.samples_per_frame = sample_rate // frame_hz
+        # `frame_hz` can be fractional (12.5 Hz on Mimi's own grid), so this is
+        # a rounded int rather than floor division - a float here reaches a
+        # slice index and fails deep inside a dataloader worker.
+        self.samples_per_frame = int(round(sample_rate / frame_hz))
         self.with_vad = with_vad
+        self.vad_dir = vad_dirname(frame_hz)
         # Swapping is label-preserving wherever speaker order is arbitrary: with
         # two channels, and with one channel whose speakers are named by the VAD.
         self.swap_channels = swap_channels and (channels == 2 or with_vad)
@@ -185,7 +201,7 @@ class Fisher(Dataset):
         )
         return (
             audio,
-            base / "vad" / group / conversation / f"{segment}.npy",
+            base / self.vad_dir / group / conversation / f"{segment}.npy",
             float(start),
             float(end) - float(start),
         )
@@ -242,7 +258,7 @@ class Fisher(Dataset):
             audio = audio.flip(0)
             vad = vad.flip(0)
 
-        num_frames = audio.shape[-1] // self.samples_per_frame
+        num_frames = int(audio.shape[-1] // self.samples_per_frame)
         labels = self._labels(vad, num_frames)
         if not self.with_vad:
             return audio, labels
@@ -257,13 +273,15 @@ class FisherEvent(Dataset):
     FIELDS = ("part", "group", "conversation", "start", "end", "prev_spk", "next_spk",
               "timing", "gap_type", "label")
 
-    def __init__(self, fisher_path, split_paths, channels=1, source="npy", with_vad=False):
+    def __init__(self, fisher_path, split_paths, channels=1, source="npy",
+                 with_vad=False, frame_hz=VAD_HZ):
         root = self.root = Path(fisher_path)
         self.channels = channels
         self.source = _check_source(source)
         self.spec = _audio_spec(channels)
         self.audio_dir = "audio" if channels == 1 else "audio_stereo"
         self.with_vad = with_vad
+        self.frame_hz = frame_hz
         self.samples = []
         if isinstance(split_paths, (str, Path)):
             split_paths = [split_paths]
@@ -350,6 +368,7 @@ class FisherEvent(Dataset):
         part, group, window_start = window
         vad = window_vad(
             str(self.root), part, group, conversation, window_start,
-            audio.shape[-1] // (TARGET_SAMPLE_RATE // VAD_HZ),
+            int(round(audio.shape[-1] / TARGET_SAMPLE_RATE * self.frame_hz)),
+            frame_hz=self.frame_hz,
         )
         return audio, label, conversation, timing, gap_type, prev_spk, vad
