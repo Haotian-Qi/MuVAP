@@ -145,6 +145,7 @@ Trained weights live on the Hub at
 | Release | Module | Frontend | Score |
 | --- | --- | --- | --- |
 | `vap-speaker-cpc` | VAP | CPC | f1_macro 0.7310 |
+| `vap-speaker-mimi` | VAP | Mimi | f1_macro 0.7755 |
 | `vap-role-cpc` | VAP | CPC | f1_macro 0.7289 |
 | `vap-role-mimi` | VAP | Mimi | f1_macro 0.7589 |
 | `asd-cpc` | ASD | CPC | mAP_official 90.4983 |
