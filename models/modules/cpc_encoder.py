@@ -4,6 +4,8 @@ from os.path import dirname, exists, join
 from typing import List
 
 import torch
+import math
+
 import torch.nn as nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
@@ -13,34 +15,44 @@ Encoder should take a wave file, then return an embedding
 """
 
 
+# 16 kHz / 160 in CPC's conv stack. `downsample` halves it once per block, so
+# the rate the model sees is a choice: 50 Hz is the original VAP's, 25 Hz halves
+# it again to meet Mimi on a shared grid.
+CPC_CONV_HZ = 100.0
+CPC_RATES = (100.0, 50.0, 25.0, 12.5)
+
+
 class CPC(nn.Module):
-    def __init__(self):
+    def __init__(self, frame_hz=25.0):
         super().__init__()
+        frame_hz = float(frame_hz)
+        if frame_hz not in CPC_RATES:
+            raise ValueError(
+                f"cpc frame_hz must be one of {CPC_RATES} (the conv stack runs at "
+                f"{CPC_CONV_HZ:g} Hz and `downsample` halves it), got {frame_hz:g}"
+            )
         self.sample_rate = 16000
-        # 16 kHz / 160 in the conv stack, halved twice by `downsample`.
-        self.frame_hz = 25.0
+        self.frame_hz = frame_hz
         self.encoder = load_CPC(True)
         self.in_dim = self.encoder.gEncoder.conv4.out_channels
         self.out_dim = 256
 
+        halvings = round(math.log2(CPC_CONV_HZ / frame_hz))
         self.downsample = nn.Sequential(
-            get_cnn_layer(
-                in_dim=self.in_dim,
-                out_dim=self.out_dim,
-                kernel=[3],
-                stride=[2],
-                dilation=[1],
-                activation="GELU",
-            ),
-            get_cnn_layer(
-                in_dim=self.out_dim,
-                out_dim=self.out_dim,
-                kernel=[3],
-                stride=[2],
-                dilation=[1],
-                activation="GELU",
-            ),
+            *[
+                get_cnn_layer(
+                    in_dim=self.in_dim if block == 0 else self.out_dim,
+                    out_dim=self.out_dim,
+                    kernel=[3],
+                    stride=[2],
+                    dilation=[1],
+                    activation="GELU",
+                )
+                for block in range(halvings)
+            ]
         )
+        if not halvings:   # 100 Hz: still bridge the encoder width onto out_dim
+            self.downsample = nn.Sequential(nn.Linear(self.in_dim, self.out_dim))
 
         self.freeze()
 

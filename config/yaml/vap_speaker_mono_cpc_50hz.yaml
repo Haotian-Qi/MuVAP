@@ -1,0 +1,73 @@
+# Anchored mono VAP at 50 Hz on CPC - the original VAP's own configuration.
+#
+# CPC's conv stack runs at 100 Hz and `downsample` halves it once per block, so
+# 50 Hz is one block instead of two. This is the rate and frontend of Ekstedt &
+# Skantze (2022); Mimi cannot reach it, its encoder tops out at 25 Hz.
+# Labels come from seg/vad50, written by 03_prep_vad_rate.py.
+fisher_path: data/fisher
+checkpoint_dir: runs/mono_cpc_50hz
+
+vap:
+  audio_encoder:
+    name: cpc
+    frame_hz: 50           # one downsample block instead of two
+
+  arch: anchored             # one mixed channel, anchored by past VAD
+  batch_size: 32
+  num_workers: 16
+  max_epochs: 5
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.0001
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  matmul_precision: high
+  # Metric that selects best.ckpt. Leave empty when there is no held-out
+  # split to select on: last.ckpt is written either way.
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+  # npy reads the segments written by preprocessing; raw seeks the same window
+  # in the source recording and resamples it.
+  source: raw
+  swap_channels: true          # channel order is arbitrary; swap both audio and VAD
+
+  projection_window:
+    bin_sec: [0.2, 0.4, 0.6, 0.8]
+    num_hist_bins: 0           # every bin is a future bin, as in the original repo
+    frame_hz: 50
+    threshold: 0.5
+    mode: speaker_based
+    cut_center_frame: false
+
+  temporal:
+    d_model: 256
+    m_ff: 3
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+    ffn: mlp
+    norm: layer
+    # Size of the sinusoidal position table. Rotary and ALiBi extend to any
+    # length, so this bounds the sinusoidal encoding only.
+    max_frames: 4096
+
+  cross:
+    d_model: 256
+    m_ff: 3
+    n_heads: 4
+    n_layers: 3
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+    ffn: mlp
+    norm: layer
+    # Size of the sinusoidal position table. Rotary and ALiBi extend to any
+    # length, so this bounds the sinusoidal encoding only.
+    max_frames: 4096
