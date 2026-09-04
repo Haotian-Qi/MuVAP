@@ -4,7 +4,7 @@ from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
 from data.dataloaders.fisher import Fisher, FisherEvent
-from models.vap import audio_channels
+from models.vap import audio_channels, needs_vad
 
 
 class VAPDataModule(LightningDataModule):
@@ -18,6 +18,7 @@ class VAPDataModule(LightningDataModule):
         self.batch_size = vap_cfg["batch_size"]
         self.num_workers = vap_cfg["num_workers"]
         self.channels = audio_channels(vap_cfg)
+        self.with_vad = needs_vad(vap_cfg)
         self.swap_channels = bool(vap_cfg.get("swap_channels", False))
         self.source = str(vap_cfg.get("source", "npy")).lower()
 
@@ -49,12 +50,14 @@ class VAPDataModule(LightningDataModule):
                 self._event_splits(["train", "val"]),
                 channels=self.channels,
                 source=self.source,
+                with_vad=self.with_vad,
             )
             self.test_dataset = FisherEvent(
                 self.root,
                 self._event_splits(["test"]),
                 channels=self.channels,
                 source=self.source,
+                with_vad=self.with_vad,
             )
 
     def _segments(self, name, swap=False):
@@ -66,6 +69,7 @@ class VAPDataModule(LightningDataModule):
             frame_hz=self.projection.frame_hz,
             swap_channels=swap,
             source=self.source,
+            with_vad=self.with_vad,
         )
 
     def _loader(self, dataset, shuffle=False):

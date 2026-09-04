@@ -1,6 +1,6 @@
 """Voice Activity Projection encoders.
 
-Two architectures share one head contract: a `[batch, frames, classes]` logit
+Three architectures share one head contract: a `[batch, frames, classes]` logit
 stream over whatever codebook the configured `ProjectionWindow` defines.
 
 * `AudioVAP` reads one mixed-mono channel. Speaker identity is not given to
@@ -10,6 +10,9 @@ stream over whatever codebook the configured `ProjectionWindow` defines.
   a shared encoder and self-attention stack, cross-attention between the two
   channels, and one head over their concatenation. Channels are ordered, so it
   pairs with the `speaker_based` codebook that projects one channel per row.
+* `AnchoredVAP` also uses the `speaker_based` codebook, but from one mixed
+  channel: the identity a second channel would carry comes instead from the
+  voice activity strictly before the frame being labelled, conditioned in.
 """
 
 import torch
@@ -93,7 +96,69 @@ class StereoVAP(nn.Module):
         return logits
 
 
-ARCHITECTURES = {"mono": AudioVAP, "stereo": StereoVAP}
+class AnchoredVAP(nn.Module):
+    """One mixed channel, anchored by the voice activity behind each frame.
+
+    This is `VapGPTMono` from the original VAP repository, on this codebase's
+    parts. `speaker_based` classes name channels, which mono audio cannot
+    identify - which is why `AudioVAP` is barred from that codebook. The voice
+    activity supplies the identity instead: a `Linear(2, d_model)`, layer
+    normalised, added to the encoder output, then the same two causal stacks the
+    stereo model uses, run back to back on the single channel.
+
+    One departure, forced by the label convention. The reference conditions on
+    the activity at frame `t` because its target starts at `t + 1`
+    (`ObjectiveVAP.projection` shifts with `va[..., 1:, :]`). `speaker_based`
+    here bins the future from `t` inclusive, so the anchor is delayed by one
+    frame to keep the same property: the model is never shown any part of the
+    window it is being asked to predict.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        model_dim = cfg["temporal"]["d_model"]
+        cross_cfg = cfg.get("cross", cfg["temporal"])
+        if cross_cfg["d_model"] != model_dim:
+            raise ValueError("AnchoredVAP temporal and cross d_model must match")
+
+        self.audio_encoder = build_audio_encoder(cfg)
+        self.encoder_proj = encoder_projection(self.audio_encoder.out_dim, model_dim)
+        # `init_va_conditioning` in the reference: orthogonal weights, and a
+        # layer norm on the conditioning before it is added to the audio.
+        self.anchor = nn.Linear(2, model_dim)
+        nn.init.orthogonal_(self.anchor.weight)
+        self.anchor_norm = nn.LayerNorm(model_dim)
+        # `ar_channel` then `ar`: both causal self-attention over one channel.
+        self.transformer = TransformerModel(cfg["temporal"])
+        self.cross = TransformerModel(cross_cfg)
+        self.vap_head = LinearHead(model_dim, ProjectionWindow(**cfg["projection_window"]).n_classes)
+
+    @staticmethod
+    def past_activity(vad):
+        """`[batch, 2, frames]` voice activity delayed by one frame."""
+        return torch.cat([torch.zeros_like(vad[:, :, :1]), vad[:, :, :-1]], dim=2)
+
+    def encode_activity(self, vad, dtype):
+        return self.anchor_norm(self.anchor(self.past_activity(vad).transpose(1, 2).to(dtype)))
+
+    def forward(self, audio, vad, return_embeddings=False):
+        if audio.ndim == 3 and audio.shape[1] != 1:
+            raise ValueError(
+                f"AnchoredVAP expects one audio channel, got {audio.shape[1]}"
+            )
+        features = self.encoder_proj(self.audio_encoder(audio))
+        if vad.shape[-1] != features.shape[1]:
+            raise ValueError(
+                f"anchor has {vad.shape[-1]} frames, audio has {features.shape[1]}"
+            )
+        embedding = self.cross(self.transformer(features + self.encode_activity(vad, features.dtype)))
+        logits = self.vap_head(embedding)
+        if return_embeddings:
+            return logits, embedding
+        return logits
+
+
+ARCHITECTURES = {"mono": AudioVAP, "stereo": StereoVAP, "anchored": AnchoredVAP}
 
 
 def build_vap(cfg):
@@ -103,6 +168,11 @@ def build_vap(cfg):
         raise ValueError(f"arch must be one of {sorted(ARCHITECTURES)}, got {arch!r}")
 
     projection = ProjectionWindow(**cfg["projection_window"])
+    if arch == "anchored" and projection.mode != "speaker_based":
+        raise ValueError(
+            "anchored conditioning names channels, so it pairs with speaker_based; "
+            "a role codebook needs no anchor"
+        )
     if arch == "mono" and projection.mode == "speaker_based":
         raise ValueError(
             "speaker_based labels name a channel, which mono audio cannot identify; "
@@ -116,3 +186,8 @@ def build_vap(cfg):
 def audio_channels(cfg):
     """Channels the configured architecture reads from disk."""
     return 2 if str(cfg.get("arch", "mono")).lower() == "stereo" else 1
+
+
+def needs_vad(cfg):
+    """Whether the architecture is conditioned on voice activity as well as audio."""
+    return str(cfg.get("arch", "mono")).lower() == "anchored"

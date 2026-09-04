@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from lightning.pytorch import LightningModule
 from sklearn.metrics import balanced_accuracy_score, f1_score
 
-from models.vap import build_vap
+from models.vap import build_vap, needs_vad
 from tasks.setup import (
     LogisticProber,
     get_adamw_optimizer,
@@ -36,16 +36,19 @@ class VAPTask(LightningModule):
         super().__init__()
         self.save_hyperparameters(cfg, ignore=["proj_win"])
         self.model = build_vap(cfg["vap"])
+        # The anchored architecture is conditioned on voice activity as well as
+        # audio, so its batches carry one more tensor than the others'.
+        self.anchored = needs_vad(cfg["vap"])
         self.proj_win = proj_win
         self.tune_outputs = []
         self.test_outputs = []
 
-    def forward(self, audio):
-        return self.model(audio)
+    def forward(self, audio, vad=None):
+        return self.model(audio, vad) if self.anchored else self.model(audio)
 
     def _shared_step(self, batch):
-        audio, labels = batch
-        logits = self(audio)
+        audio, labels, *rest = batch
+        logits = self(audio, rest[0] if self.anchored else None)
         if self.proj_win.mode == "independent":
             return F.binary_cross_entropy_with_logits(logits, labels.float())
         return F.cross_entropy(logits.transpose(1, 2), labels.long())
@@ -60,8 +63,12 @@ class VAPTask(LightningModule):
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
-        audio, labels, _, timing, _, prev_spk = batch
-        logits, embedding = self.model(audio, return_embeddings=True)
+        audio, labels, _, timing, _, prev_spk, *rest = batch
+        logits, embedding = (
+            self.model(audio, rest[0], return_embeddings=True)
+            if self.anchored
+            else self.model(audio, return_embeddings=True)
+        )
         output = {
             "embedding": embedding[:, -1].float().detach().cpu(),
             "logits": logits[:, -1].float().detach().cpu(),

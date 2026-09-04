@@ -18,6 +18,7 @@ each other.
 """
 
 from functools import lru_cache
+from glob import glob
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,7 @@ from data.media import AudioSpec, load_waveform
 from preprocess.vap.utils import EVENT_SEG_LEN_SEC, event_crop
 
 SOURCES = ("npy", "raw")
+VAD_HZ = 25
 TARGET_SAMPLE_RATE = 16_000
 # Resampling a slice is not the same as slicing a resampled recording: the
 # filter needs signal beyond both edges. Read this much extra and trim it off.
@@ -39,6 +41,46 @@ RESAMPLE_PAD_SEC = 0.1
 @lru_cache(maxsize=1024)
 def _source_rate(path):
     return sf.info(path).samplerate
+
+
+@lru_cache(maxsize=256)
+def _speech_regions(root, part, group, conversation):
+    """Word-level speech intervals per speaker, as `((start, end), ...)` seconds.
+
+    The event clips ship as audio only, but an anchored model needs the voice
+    activity behind them. It comes from the same word annotations preprocessing
+    rasterized to build the training VAD, so the two cannot disagree.
+    """
+    pattern = Path(root) / part / "regions_vap" / group / f"{conversation}_*_words.txt"
+    speakers = []
+    for path in sorted(glob(str(pattern))):
+        with open(path) as handle:
+            speakers.append(
+                tuple(
+                    (float(line.split()[0]), float(line.split()[1]))
+                    for line in handle
+                    if line.strip()
+                )
+            )
+    if len(speakers) != 2:
+        raise FileNotFoundError(
+            f"expected two *_words.txt for {conversation} under {pattern.parent}, "
+            f"found {len(speakers)}"
+        )
+    return tuple(speakers)
+
+
+def window_vad(root, part, group, conversation, start_sec, frames, frame_hz=VAD_HZ):
+    """`[2, frames]` voice activity for the window starting at `start_sec`."""
+    vad = torch.zeros(2, frames)
+    for speaker, regions in enumerate(_speech_regions(root, part, group, conversation)):
+        for begin, end in regions:
+            first = int(round((begin - start_sec) * frame_hz))
+            last = int(round((end - start_sec) * frame_hz))
+            if last <= 0 or first >= frames:
+                continue
+            vad[speaker, max(0, first) : min(frames, last)] = 1.0
+    return vad
 
 
 def read_source_window(path, start_sec, duration_sec, channels):
@@ -111,6 +153,7 @@ class Fisher(Dataset):
         sample_rate=16_000,
         swap_channels=False,
         source="npy",
+        with_vad=False,
     ):
         self.root = Path(fisher_path)
         self.projection = projection
@@ -118,7 +161,10 @@ class Fisher(Dataset):
         self.source = _check_source(source)
         self.spec = _audio_spec(channels)
         self.samples_per_frame = sample_rate // frame_hz
-        self.swap_channels = swap_channels and channels == 2
+        self.with_vad = with_vad
+        # Swapping is label-preserving wherever speaker order is arbitrary: with
+        # two channels, and with one channel whose speakers are named by the VAD.
+        self.swap_channels = swap_channels and (channels == 2 or with_vad)
         if projection.frame_hz != frame_hz:
             raise ValueError(
                 f"projection is defined at {projection.frame_hz} Hz but the dataset runs at {frame_hz} Hz"
@@ -197,7 +243,12 @@ class Fisher(Dataset):
             vad = vad.flip(0)
 
         num_frames = audio.shape[-1] // self.samples_per_frame
-        return audio, self._labels(vad, num_frames)
+        labels = self._labels(vad, num_frames)
+        if not self.with_vad:
+            return audio, labels
+        # The same frames the labels cover, so the anchor lines up with them.
+        context = (vad.shape[-1] - num_frames) // 2
+        return audio, labels, vad[:, context : context + num_frames]
 
 
 class FisherEvent(Dataset):
@@ -206,12 +257,13 @@ class FisherEvent(Dataset):
     FIELDS = ("part", "group", "conversation", "start", "end", "prev_spk", "next_spk",
               "timing", "gap_type", "label")
 
-    def __init__(self, fisher_path, split_paths, channels=1, source="npy"):
-        root = Path(fisher_path)
+    def __init__(self, fisher_path, split_paths, channels=1, source="npy", with_vad=False):
+        root = self.root = Path(fisher_path)
         self.channels = channels
         self.source = _check_source(source)
         self.spec = _audio_spec(channels)
         self.audio_dir = "audio" if channels == 1 else "audio_stereo"
+        self.with_vad = with_vad
         self.samples = []
         if isinstance(split_paths, (str, Path)):
             split_paths = [split_paths]
@@ -222,14 +274,18 @@ class FisherEvent(Dataset):
                     if not line.strip():
                         continue
                     fields = dict(zip(self.FIELDS, line.split()))
+                    # The window is defined the same way for both sources; `raw`
+                    # seeks it, `npy` reads a clip already cut to it. An anchored
+                    # model needs its absolute start either way, to line the
+                    # voice activity up with the audio.
+                    crop = event_crop(
+                        fields["timing"],
+                        float(fields["start"]),
+                        float(fields["end"]),
+                    )
+                    if crop is None and (self.source == "raw" or self.with_vad):
+                        continue
                     if self.source == "raw":
-                        crop = event_crop(
-                            fields["timing"],
-                            float(fields["start"]),
-                            float(fields["end"]),
-                        )
-                        if crop is None:
-                            continue
                         audio_path = (
                             root
                             / fields["part"]
@@ -258,6 +314,7 @@ class FisherEvent(Dataset):
                             fields["gap_type"],
                             int(fields["prev_spk"]),
                             crop_start,
+                            (fields["part"], fields["group"], crop[0] if crop else None),
                         )
                     )
 
@@ -273,6 +330,7 @@ class FisherEvent(Dataset):
             gap_type,
             prev_spk,
             crop_start,
+            window,
         ) = self.samples[index]
 
         if self.source == "raw":
@@ -287,4 +345,11 @@ class FisherEvent(Dataset):
                     "Re-run preprocess/vap/02_prep_event.py with --channels 2, "
                     "or set vap.source: raw to read the source recording instead"
                 )
-        return audio, label, conversation, timing, gap_type, prev_spk
+        if not self.with_vad:
+            return audio, label, conversation, timing, gap_type, prev_spk
+        part, group, window_start = window
+        vad = window_vad(
+            str(self.root), part, group, conversation, window_start,
+            audio.shape[-1] // (TARGET_SAMPLE_RATE // VAD_HZ),
+        )
+        return audio, label, conversation, timing, gap_type, prev_spk, vad

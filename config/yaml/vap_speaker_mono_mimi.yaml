@@ -1,0 +1,79 @@
+# Speaker-based VAP from ONE channel, anchored by voice activity.
+#
+# The 256-class codebook names channels, which mono audio cannot identify. Here
+# the identity comes from the VAD instead: the model hears the mixture and is
+# told who held the floor strictly before the frame it is labelling, so the two
+# rows stay attached to real speakers without a second channel. The anchor is
+# delayed by one frame because speaker_based bins the future from `t` inclusive.
+#
+# Frozen Mimi frontend, so this is comparable to vap-speaker-mimi on everything
+# but the number of channels.
+fisher_path: data/fisher
+checkpoint_dir: runs/vap_speaker_mono_mimi
+
+vap:
+  # Frozen 37.8M Mimi encoder. Its 512-dim features are bridged onto d_model by
+  # the model's encoder projection.
+  audio_encoder:
+    name: mimi
+    tap: encoder            # 25 Hz, matching the label grid
+
+  arch: anchored             # one mixed channel, anchored by past VAD
+  batch_size: 32
+  num_workers: 16
+  max_epochs: 5
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.0001
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  matmul_precision: high
+  # Metric that selects best.ckpt. Leave empty when there is no held-out
+  # split to select on: last.ckpt is written either way.
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+  # npy reads the segments written by preprocessing; raw seeks the same window
+  # in the source recording and resamples it.
+  source: raw
+  swap_channels: true          # channel order is arbitrary; swap both audio and VAD
+
+  projection_window:
+    bin_sec: [0.2, 0.4, 0.6, 0.8]
+    num_hist_bins: 0           # every bin is a future bin, as in the original repo
+    frame_hz: 25
+    threshold: 0.5
+    mode: speaker_based
+    cut_center_frame: false
+
+  temporal:
+    d_model: 256
+    m_ff: 3
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+    ffn: mlp
+    norm: layer
+    # Size of the sinusoidal position table. Rotary and ALiBi extend to any
+    # length, so this bounds the sinusoidal encoding only.
+    max_frames: 4096
+
+  cross:
+    d_model: 256
+    m_ff: 3
+    n_heads: 4
+    n_layers: 3
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+    ffn: mlp
+    norm: layer
+    # Size of the sinusoidal position table. Rotary and ALiBi extend to any
+    # length, so this bounds the sinusoidal encoding only.
+    max_frames: 4096
