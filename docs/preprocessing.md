@@ -54,6 +54,12 @@ grayscale, recorded in `dataset.json` as `face_shape` and `face_color`. It is
 the ASD community's standard geometry rather than a MuVAP+ choice, but a reader
 should check it rather than assume it.
 
+The size is a constant in two places, not a config key: `FACE_SIZE` in
+`preprocess/asd/schema.py`, which the writer resizes every JPEG face to, and
+`VisualSpec` in `data/media.py`, which is what the loader and the model expect.
+Changing the geometry means editing both and re-running preprocessing - a pack
+written at one size cannot be read at another.
+
 ## AVA
 
 ```bash

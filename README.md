@@ -77,6 +77,25 @@ here too.
 python train_asd.py --config config/yaml/asd.yaml --name asd
 ```
 
+Faces reach the model as 112x112 grayscale, the geometry the packs are written
+in - see [preprocessing](docs/preprocessing.md) for where that is fixed and why.
+On top of it, `asd.augment` applies one geometric transform per chunk, drawn
+uniformly from none, horizontal flip, random crop rescaled back to 112, and
+rotation; `crop_scale` is the side of that crop as a fraction of the frame.
+Audio is augmented separately: with probability `audio_mix_prob` a donor clip
+is mixed in at an SNR drawn from `audio_snr_db` while the label stays unchanged,
+so the model has to reject speech it cannot see on the face.
+
+```yaml
+augment:
+  audio_mix_prob: 0.5          # chance of mixing in off-screen speech
+  audio_snr_db: [-5.0, 5.0]    # how loud that donor is against the real audio
+  visual: true                 # geometric transforms on the face track
+  crop_scale: [0.7, 1.0]       # random-crop side, as a fraction of 112
+  rotate_degrees: 15.0         # maximum rotation
+  substitute_audio_prob: 0.0   # ablation: replace the audio, relabel silent
+```
+
 Every source corpus is packed into one memory-mapped format first. A pack is a
 decoded mirror of the corpus, not a model-ready tensor set: grayscale face
 crops and one label per frame at the *native* video rate, plus 16 kHz audio at
