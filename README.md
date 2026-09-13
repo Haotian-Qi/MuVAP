@@ -13,7 +13,7 @@ own, without the modules that have not landed yet.
 | --- | --- | --- |
 | VAP — voice activity projection from audio | released | `train_vap.py` |
 | ASD — audio-visual active speaker detection | released | `train_asd.py` |
-| MuVAP — multiparty fusion of the two | to follow | — |
+| MuVAP — multiparty fusion of the two | released | `train_muvap.py` |
 
 ## Install
 
@@ -130,16 +130,58 @@ unnormalized and the loader applies this; the constants live in
 `data/media.py`.
 
 
-## Running either module
+## MuVAP
 
-`--set KEY=VALUE` overrides any config value (dotted path, YAML-parsed) and can
-be repeated; it fails on a key the config does not already define, so a typo
+Multiparty fusion: the VAP module's account of the conversation and the ASD
+module's account of each visible face, read together to predict who holds the
+floor next — and, among however many people are on screen, *which* of them
+takes it. Neither frozen module is updated; what trains is the fusion.
+
+```bash
+python train_muvap.py --config config/yaml/muvap.yaml --name muvap
+```
+
+Conversations are packed the same way the ASD corpora are — a decoded mirror of
+the corpus, native frame rate, audio at its original gain — with the grouping
+the fusion needs and the ASD format cannot express: all of a segment's faces,
+the one mixed recording they share, one activity row per speaker.
+
+```bash
+python -m preprocess.muvap.prepare segments --root /data/AVCC --split train
+python -m preprocess.muvap.prepare events   --root /data/AVCC --split test \
+    --events /data/AVCC/test_events.txt
+```
+
+Nothing in training changes the frozen modules, so `muvap.source` chooses
+whether to run them at all. `media` reads faces and audio and runs them on every
+batch; `embeddings` reads what they produced once:
+
+```bash
+python -m preprocess.muvap.extract \
+    --pack /data/AVCC/packed/segments.train \
+    --output /data/AVCC/packed/embeddings.segments.train \
+    --vap-weights weights/vap-role-mimi --asd-weights weights/asd-mimi
+```
+
+Both packs go through one reader and one loader, so switching between them
+changes only how long an epoch takes. `tools/render_sample.py` writes any packed
+sample out as a self-contained HTML page - audio, faces, and every label stream
+on one timeline - which is how you check an alignment rather than a tensor
+shape. See [`docs/muvap.md`](docs/muvap.md) for
+the two projection windows, the pack format, what the batching guarantees, and
+the turn-event protocol behind the reported numbers.
+
+
+## Running any module
+
+All three share one program shape. `--set KEY=VALUE` overrides any config value
+(dotted path, YAML-parsed) and can be repeated; it fails on a key the config does not already define, so a typo
 cannot silently do nothing. `--wandb` enables tracking, `--name` chooses the
 run directory.
 
-`checkpoint_monitor` picks what `best.ckpt` selects on — `val/loss` for VAP,
-`val/mAP_official` for ASD. Clear it where there is no held-out split to select
-on, and the final epoch is the only artifact the run keeps:
+`checkpoint_monitor` picks what `best.ckpt` selects on — `val/loss` for VAP and
+MuVAP, `val/mAP_official` for ASD. Clear it where there is no held-out split to
+select on, and the final epoch is the only artifact the run keeps:
 
 ```bash
 python train_vap.py --config config/yaml/vap_role.yaml --set vap.checkpoint_monitor=
@@ -203,6 +245,8 @@ Publish either one with:
 ```bash
 python tools/export_checkpoint.py <run>/last.ckpt <release dir> --module vap
 ```
+
+`--module` takes `vap`, `asd`, or `muvap`.
 
 A release carries the trained weights alone: no optimizer state, and no copy of
 the frozen audio frontend, which is fetched from its own pretrained source when

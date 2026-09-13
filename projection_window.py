@@ -5,17 +5,24 @@ A class is an ordered pair of `row_bins`-bit rows. What a row is, per mode:
 * `speaker_based` - one row per channel, in channel order. The original VAP:
   2 speakers x 4 future bins = 256 classes. The rows name channels, not roles,
   so hold/shift needs the event's floor holder.
-* `role_relative` - N speakers ranked down to a pair on the 1.4, 0.6, 0.6, 1.4
-  window and encoded `Scurr` first, then folded onto `16 * 17 / 2 = 136`
-  classes. Row 1 is the next speaker, so its `p_future` is the shift.
+* `role_relative` / `role_future` - N speakers ranked down to a pair on the
+  coarse 1.4, 0.6, 0.6, 1.4 window, encoded `Scurr` first, then folded onto
+  `16 * 17 / 2 = 136` classes. Row 1 is the next speaker, so its `p_future` is
+  the shift. `role_relative` encodes that window as it stands; `role_future`
+  re-encodes the ranked pair's future four times finer and drops the history.
 * `independent` - no codebook, the raw per-speaker bins.
+
+The fold is a bijection only where the ranking can be read back off the rows,
+which needs history in the row - see `_role_codebook`.
 """
 
 import torch
 import torch.nn.functional as F
 
-P_FUTURE_SEC = 1.4   # hold/shift is decided over the trailing 1.4s
-MODES = ("role_relative", "speaker_based", "independent")
+ROLE_WINDOW_SEC = (1.4, 0.6, 0.6, 1.4)   # the window the role modes rank on
+P_FUTURE_SEC = 1.4                       # hold/shift is decided over the trailing 1.4s
+ROLE_MODES = ("role_relative", "role_future")
+MODES = ROLE_MODES + ("speaker_based", "independent")
 
 
 def bin_times_to_frames(bin_times, frame_hz):
@@ -40,6 +47,8 @@ class ProjectionWindow:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         if mode == "role_relative" and (len(bin_sec) != 4 or num_hist_bins != 2):
             raise ValueError("role_relative needs two history and two future bins")
+        if mode == "role_future" and (len(bin_sec) != 6 or num_hist_bins != 2):
+            raise ValueError("role_future needs two history and four future bins")
 
         self.mode = mode
         self.bin_sec = list(bin_sec)
@@ -68,9 +77,15 @@ class ProjectionWindow:
 
         self._lead = 0 if cut_center_frame or self.hist_frames == 0 else 1
         self._skip = 1 if cut_center_frame else 0
+        # `role_future` ranks on the coarse window but encodes a finer one, so
+        # the two binnings are kept apart; every other mode has them coincide.
+        self.coarse_sec = self.bin_sec if keeps_history else list(ROLE_WINDOW_SEC)
+        self.coarse_frames = bin_times_to_frames(self.coarse_sec, frame_hz)
         self._offsets = self._bin_offsets(self.bin_frames)
-        self._hist_sec = torch.tensor(self.bin_sec[:num_hist_bins])
-        self._fut_sec = torch.tensor(self.bin_sec[num_hist_bins:])
+        self._coarse_offsets = self._bin_offsets(self.coarse_frames)
+        self._same_coarse = self.coarse_frames == self.bin_frames
+        self._hist_sec = torch.tensor(self.coarse_sec[:num_hist_bins])
+        self._fut_sec = torch.tensor(self.coarse_sec[num_hist_bins:])
         self._weights = 2 ** torch.arange(self.row_bins - 1, -1, -1)
         self._pair_weights = 2 ** torch.arange(2 * self.row_bins - 1, -1, -1)
         self._slots = {}
@@ -83,7 +98,7 @@ class ProjectionWindow:
 
     @property
     def is_role_based(self):
-        return self.mode == "role_relative"
+        return self.mode in ROLE_MODES
 
     # ---------------------------------------------------------------- codebook
 
@@ -99,16 +114,21 @@ class ProjectionWindow:
 
         Indices follow the paper's enumeration, by pattern value; the pair each
         index *stores* is the ranked one, so `decode` returns `(Scurr, Snext)`
-        with nothing to recompute. That works because the ranking is a function
-        of the rows - each role keeps its own history bins - so a pair whose top
-        row ranks below its bottom row never occurs: exactly 136 of the 256
-        ordered states are reachable and the fold is a bijection.
+        with nothing to recompute. That ordering is recoverable only when the
+        ranking is a function of the rows: `role_relative` keeps each role's
+        history so exactly 136 of the 256 ordered states occur and the fold is a
+        bijection, while `role_future` ranks on history it drops, so both
+        orderings occur and 48 of its classes hold a hold and its mirror shift.
+        There the stored order is the best guess - the row that speaks up first.
         """
         patterns = self._codebook(self.row_bins)
         size = len(patterns)
         split = self.row_hist_bins
-        rank = self._activity(patterns[:, :split], self._row_sec[:split]) * 10
-        rank += self._activity(patterns[:, split:], self._row_sec[split:])
+        if split:
+            rank = self._activity(patterns[:, :split], self._row_sec[:split]) * 10
+            rank += self._activity(patterns[:, split:], self._row_sec[split:])
+        else:
+            rank = torch.arange(size, dtype=torch.float)
 
         fold = torch.empty(size * size, dtype=torch.long)
         codebook = torch.empty(size * (size + 1) // 2, 2 * self.row_bins)
@@ -154,21 +174,37 @@ class ProjectionWindow:
             self._totals(activity), self._offsets, activity.shape[1], activity.dtype
         )
 
+    def coarse_bins(self, activity):
+        """The ranking view, re-binned from the window rather than folded down.
+
+        OR-ing 0.2 and 0.4 is not the 0.6 bin - 0.2s of speech fills the 0.2 bin
+        but is a third of the 0.6 span - and the union would rank `role_future`
+        on frames `role_relative` does not.
+        """
+        return self._bins(
+            self._totals(activity),
+            self._coarse_offsets,
+            activity.shape[1],
+            activity.dtype,
+        )
+
     def _activity(self, bins, seconds):
         """Seconds of activity: the 2, 1 / 1, 2 weighting of the original code."""
         return (bins * seconds.to(bins.device)).sum(dim=-1)
 
-    def _rank_roles(self, bins):
+    def _rank_roles(self, coarse):
         """History picks `Scurr`; the remaining speakers' future picks `Snext`.
 
-        When the top two tie on history outright, stage 1's runner-up takes the
-        second slot rather than the speaker with the most future.
+        The ranking always reads the coarse window, which is the encoded window
+        itself for every mode but `role_future`. When the top two tie on history
+        outright, stage 1's runner-up takes the second slot rather than the
+        speaker with the most future.
         """
-        history = self._activity(bins[..., : self.num_hist_bins], self._hist_sec)
-        future = self._activity(bins[..., self.num_hist_bins :], self._fut_sec)
+        history = self._activity(coarse[..., : self.num_hist_bins], self._hist_sec)
+        future = self._activity(coarse[..., self.num_hist_bins :], self._fut_sec)
         by_history = history * 10 + future
 
-        if bins.shape[2] == 2:                       # stage 2 has one candidate left
+        if coarse.shape[2] == 2:                     # stage 2 has one candidate left
             current = (by_history[..., 1:] > by_history[..., :1]).long()
             return torch.cat([current, 1 - current], dim=2)
 
@@ -179,6 +215,26 @@ class ProjectionWindow:
         by_future.scatter_(2, current, -torch.inf)
         following = torch.where(tied, runner_up, by_future.argmax(dim=2, keepdim=True))
         return torch.cat([current, following], dim=2)
+
+    @torch.no_grad()
+    def role_window(self, activity):
+        """The ranked pair's window, in the classic VAP shape.
+
+        `[B, frames, 2, len(coarse_sec)]` - row 0 is `Scurr`, row 1 is `Snext`,
+        and the bins are the two history and two future bins the role modes rank
+        on. For `role_relative` that window *is* what the class encodes, so this
+        is the target itself. For `role_future` it is the window the ranking
+        used before the class re-encoded the future more finely, which is the
+        only way to see the history the mode drops.
+        """
+        if not self.is_role_based:
+            raise ValueError(f"{self.mode} has no roles to rank")
+        activity = activity.transpose(1, 2)
+        coarse = self.coarse_bins(activity)
+        if coarse.shape[2] < 2:
+            raise ValueError("ranking roles requires at least two speakers")
+        order = self._rank_roles(coarse)
+        return coarse.gather(2, order.unsqueeze(-1).expand(-1, -1, -1, coarse.shape[-1]))
 
     @torch.no_grad()
     def get_labels(self, activity):
@@ -199,9 +255,15 @@ class ProjectionWindow:
             pair = bins[..., self.num_hist_bins :].flatten(start_dim=2)
             return (pair * self._pair_weights.to(pair.dtype)).sum(dim=-1).long()
 
+        rows = bins if self.row_hist_bins else bins[..., self.num_hist_bins :]
         # Index every row first: gathering two integers beats gathering two rows.
-        patterns = (bins * self._weights.to(bins.dtype)).sum(dim=-1).long()
-        speakers = self._rank_roles(bins)
+        patterns = (rows * self._weights.to(rows.dtype)).sum(dim=-1).long()
+        coarse = (
+            bins
+            if self._same_coarse
+            else self._bins(totals, self._coarse_offsets, frames, activity.dtype)
+        )
+        speakers = self._rank_roles(coarse)
         ordered = patterns.gather(2, speakers[..., :1]) * 2**self.row_bins
         ordered += patterns.gather(2, speakers[..., 1:])
         return self.fold.to(ordered.device)[ordered.squeeze(-1)]

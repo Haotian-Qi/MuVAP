@@ -1,0 +1,135 @@
+# Multiparty fusion of the VAP and ASD modules, on packed AVCC conversations.
+checkpoint_dir: runs/muvap
+
+# Conversation packs, written by preprocess/muvap/prepare.py. Train and val hold
+# whole segments; test holds one anchored window per annotated turn event.
+#
+# These may be media packs or the embedding packs extracted from them - the
+# reader takes either, and `muvap.source` below says which the model expects.
+# Embeddings train several times faster and are several times smaller; reach for
+# the media packs to change or fine-tune a frozen module.
+packed_muvap:
+  train:
+    - data/AVCC/packed/embeddings.segments.train
+  val:
+    - data/AVCC/packed/embeddings.segments.val
+  test:
+    - data/AVCC/packed/embeddings.events.test
+
+muvap:
+  num_workers: 8
+  max_epochs: 5
+  seed: 0
+
+  # embeddings: read what preprocess/muvap/extract.py cached.
+  # media: read faces and audio, and run the frozen modules on every batch. That
+  # needs `vap:` and `asd:` sections below, holding the architectures the
+  # weights were trained with.
+  source: embeddings
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  matmul_precision: high
+  # Metric that selects best.ckpt. Leave empty when there is no held-out split
+  # to select on: last.ckpt is written either way.
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+
+  # Segments are cut into 30 s windows overlapping by 10 s, at 25 Hz. The pack
+  # stores whole segments and the grid is built here, per epoch: cutting it to
+  # disk instead would duplicate 44% of the face data and read no faster.
+  train_window: 750        # 30 s
+  train_overlap: 250       # 10 s
+
+  # A batch must agree on its speaker count, because the speaker axis is a real
+  # tensor dimension: the sampler groups by that first, sizes second.
+  batch_size: 16
+  # Used only when batch_size is empty: build each batch to a frame budget
+  # instead, which holds activation memory steady across uneven lengths.
+  frame_budget: 4096
+  min_batch: 1
+  max_batch: 16
+
+  # Validation and test are forward-only, so they afford a larger budget.
+  val_frame_budget: 16384
+  val_max_batch: 64
+
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.0001          # the paper decays 1e-3 to 1e-4 over five epochs
+
+  # What the two frozen modules emit, and therefore what the fusion reads. These
+  # have to match the releases the embeddings were extracted with: VAP's
+  # temporal d_model, and twice ASD's cross d_model.
+  vap_dim: 256
+  asd_dim: 512
+
+  # The global head: the conversation ranked down to a pair of roles, then the
+  # Role-Relative Projection - two history bins and two future bins per role,
+  # 1.4 / 0.6 / 0.6 / 1.4 s, folded onto 136 classes because (Scurr, Snext) and
+  # (Snext, Scurr) are the same state. This is the VAP module's own window, so
+  # the dyadic and multiparty hold/shift numbers are the same measurement.
+  gvap_projection_window:
+    bin_sec: [1.4, 0.6, 0.6, 1.4]
+    num_hist_bins: 2
+    frame_hz: 25
+    threshold: 0.5
+    mode: role_relative
+    cut_center_frame: false
+
+  # The per-speaker head: no codebook, because a class names a pair and one face
+  # can only answer for itself. Four independent future bins, scored per bin.
+  svap_projection_window:
+    bin_sec: [0.2, 0.4, 0.6, 0.8]
+    num_hist_bins: 0
+    frame_hz: 25
+    threshold: 0.5
+    mode: independent
+    cut_center_frame: false
+
+  # Attention across the speakers inside one frame. There is no order and no
+  # position on that axis, so this stack builds neither.
+  frame:
+    d_model: 256
+    m_ff: 4
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+
+  # Attention along time over the fused stream. Causal, like every other
+  # temporal stack in this codebase.
+  temporal:
+    d_model: 256
+    m_ff: 4
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi        # alibi | rope | sinusoidal | none
+    ffn: mlp                   # mlp | swiglu
+    norm: layer                # layer | rms
+    max_frames: 4096
+
+# Uncomment with `source: media` to run the frozen modules on every batch. Both
+# must be the architectures the weights being loaded were trained with; copying
+# them from the release's own config.yaml is the reliable way.
+#
+# vap:
+#   arch: mono
+#   audio_encoder: mimi
+#   projection_window: {bin_sec: [1.4, 0.6, 0.6, 1.4], num_hist_bins: 2, frame_hz: 25,
+#                       threshold: 0.5, mode: role_relative, cut_center_frame: false}
+#   temporal: {d_model: 256, m_ff: 3, n_heads: 4, n_layers: 4, dropout: 0.1,
+#              activation: GELU, causal: true, pos_encoding: alibi}
+#
+# asd:
+#   audio_encoder: mimi
+#   projection_window: {bin_sec: [0.8, 0.6, 0.4, 0.2, 0.2, 0.4], num_hist_bins: 4,
+#                       frame_hz: 25, threshold: 0.5, mode: independent,
+#                       cut_center_frame: false}
+#   cross: {d_model: 256, m_ff: 4, n_heads: 4, n_layers: 1, dropout: 0.1, activation: GELU}
+#   temporal: {d_model: 512, m_ff: 4, n_heads: 8, n_layers: 1, dropout: 0.1, activation: GELU}
