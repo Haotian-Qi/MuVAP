@@ -12,7 +12,7 @@ Three readouts, all taken from one forward pass:
   than a verdict;
 * **per-speaker activity** from the first SVAP bin. That bin covers the 0.2 s
   straddling now, which makes it the model's own answer to "is this face
-  talking", and on this clip it matches the annotation 90% of the time;
+  talking";
 * **the annotation itself**, drawn behind the prediction in a lighter tone so
   agreement and disagreement are both visible at a glance.
 """

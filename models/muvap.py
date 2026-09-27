@@ -18,11 +18,14 @@ The streams arrive either precomputed or produced on the fly by
 `FrozenEncoders`, which is the same code in both cases: the extraction tool and
 the raw path run one implementation, so an embedding pack is a cache rather than
 a second version of the model. How much history each frame was encoded with is
-the one thing that separates them - see `docs/muvap.md`.
+the one thing that separates them.
 """
+
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+import yaml
 
 from projection_window import ProjectionWindow
 
@@ -201,3 +204,27 @@ def build_frozen_encoders(cfg):
             "the run would be training on noise."
         )
     return frozen_pair(weights["vap"], weights["asd"], cfg.get("vap"), cfg.get("asd"))
+
+
+def load_fusion(weights, config=None):
+    """A trained fusion, from a published release or a training checkpoint.
+
+    A release carries its own `config.yaml`, which is the architecture to trust.
+    A `.ckpt` carries the config it was trained with among its hyperparameters;
+    `config` is only read for a checkpoint that predates that. Returns the model
+    and the `muvap` config it was built from.
+    """
+    path = Path(weights)
+    fallback = yaml.safe_load(open(config))["muvap"] if config else None
+    if path.suffix != ".ckpt":
+        weights_path, cfg = module_config(path, "muvap", fallback)
+        return load_weights(MultiModalVAP(cfg), weights_path), cfg
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = state.get("hyper_parameters", {}).get("muvap") or fallback
+    if cfg is None:
+        raise SystemExit(f"{path} carries no muvap config; pass the one it was trained with")
+    model = MultiModalVAP(cfg)
+    model.load_state_dict(
+        {k[6:]: v for k, v in state["state_dict"].items() if k.startswith("model.")}
+    )
+    return model, cfg

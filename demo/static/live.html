@@ -55,11 +55,18 @@
 
 <div class="panel">
   <canvas id="strip"></canvas>
+  <div class="row" style="margin-top:10px">
+    <label for="sscale" class="stat">shift scale</label>
+    <input type="range" id="sscale" min="-2" max="3" step="0.05" value="1"
+           style="flex:1;min-width:140px">
+    <span class="stat" id="sscaleVal">2.00</span>
+    <button id="sscaleReset" style="padding:3px 10px;font-size:12px">default</button>
+  </div>
   <div class="legend">
     <span><i class="sw" style="background:var(--hot)"></i>p(shift) above 0.5</span>
     <span><i class="sw" style="background:var(--cool)"></i>below 0.5</span>
     <span><i class="sw" style="background:var(--pred)"></i>predicted speech (SVAP bin 1)</span>
-    <span>every value is a model output</span>
+    <span>every value is a model output, read at the shift scale below</span>
   </div>
 </div>
 
@@ -86,6 +93,23 @@ let tracks = [], faceCells = new Map(), ws = null, stream = null, ctxAudio = nul
 let frames = 0, latency = 0, sentF = 0, sentA = 0;
 
 function shiftIn(arr, value) { arr.copyWithin(0, 1); arr[WIN - 1] = value; }
+
+/* ---- shift scale -------------------------------------------------------
+   The weight `get_shift_hold` puts on the shift row before the two rows are
+   renormalised, so 1 is the plain readout and the window's own default (2 for
+   the role modes) is what the server starts on. It is applied server-side, on
+   the model's logits - moving it does not rescale what is already drawn, the
+   new setting arrives with the next prediction and rolls in from the right.
+   The slider travels in powers of two, because the useful range is a ratio. */
+let sScale = null, sDefault = null;
+const sscale = document.getElementById("sscale"), sscaleVal = document.getElementById("sscaleVal");
+function showScale(v) { sscaleVal.textContent = v.toFixed(2); sscale.value = Math.log2(v); }
+function sendScale(v) {
+  sScale = v; showScale(v);
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ shift_scale: v }));
+}
+sscale.oninput = () => sendScale(2 ** +sscale.value);
+document.getElementById("sscaleReset").onclick = () => { if (sDefault !== null) sendScale(sDefault); };
 
 /* ---- timeline ---------------------------------------------------------- */
 const ROW = 22, GAP = 6, PAD = 78, RIGHT = 12, PROB = 76;
@@ -220,6 +244,13 @@ async function start() {
     const m = JSON.parse(ev.data);
     /* one slot per model frame, so the window really is 10 s wide */
     if (m.capacity) CAP = m.capacity;
+    /* The server reports the scale it actually used, which is the window's own
+       default until the slider is moved; the slider's ends are the server's
+       bounds, so nothing it sends back can disagree with what is shown. */
+    if (m.shift_scale != null) {
+      if (sDefault === null) sDefault = m.shift_scale;
+      if (sScale === null) { sScale = m.shift_scale; showScale(sScale); }
+    }
     /* A speaker who appears gets a row; one who leaves keeps theirs. */
     let fresh = false;
     for (const s of m.speakers || []) if (!shown.includes(s)) { shown.push(s); fresh = true; }
@@ -237,6 +268,7 @@ async function start() {
     }
     tracks = m.tracks; frames = m.frames; latency = m.latency_ms;
   };
+  ws.onopen = () => { if (sScale !== null) ws.send(JSON.stringify({ shift_scale: sScale })); };
   ws.onclose = () => stop();
 
   /* audio: the server's clock, so it must be continuous */

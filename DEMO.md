@@ -11,9 +11,17 @@ module docstring of `demo/tracker.py`, and the fusion itself is `docs/muvap.md`.
 
 ## Before you start
 
-The demo needs the two frozen modules, a trained fusion checkpoint, and a TLS
-certificate. Released weights come from the Hugging Face repo named in the
-[README](README.md); the checkpoint is whatever `train_muvap.py` wrote.
+The demo needs the three releases - the two frozen modules and the fusion
+trained on them - and a TLS certificate. Releases come from the Hugging Face
+repo named in the [README](README.md); a pair must be the one the fusion was
+trained on, so `muvap-role-mimi` runs with `vap-role-mimi` and `asd-mimi`, and
+`muvap-role-cpc` with the two `-cpc` releases. `--muvap-weights` also takes a
+`.ckpt` that `train_muvap.py` wrote.
+
+```bash
+huggingface-cli download Haotian-Qi/MuVAP \
+    --include 'vap-role-mimi/*' 'asd-mimi/*' 'muvap-role-mimi/*' --local-dir weights
+```
 
 A camera only opens on a secure origin, so the server has to speak https. A
 self-signed certificate is enough - the browser warns once and you accept it:
@@ -33,9 +41,9 @@ The demo needs a few packages beyond the training extras - `fastapi`,
 
 ```bash
 python -u -m demo.server \
-  --vap-weights weights/vap-role-cpc \
-  --asd-weights weights/asd-cpc \
-  --checkpoint <run>/best.ckpt \
+  --vap-weights weights/vap-role-mimi \
+  --asd-weights weights/asd-mimi \
+  --muvap-weights weights/muvap-role-mimi \
   --certfile cert/cert.pem \
   --keyfile cert/key.pem \
   --port 8443
@@ -55,9 +63,9 @@ Long runs belong in tmux, since the process must outlive the shell:
 ```bash
 tmux new-session -d -s live -n server
 tmux send-keys -t live:server 'python -u -m demo.server \
-  --vap-weights weights/vap-role-cpc \
-  --asd-weights weights/asd-cpc \
-  --checkpoint <run>/best.ckpt \
+  --vap-weights weights/vap-role-mimi \
+  --asd-weights weights/asd-mimi \
+  --muvap-weights weights/muvap-role-mimi \
   --certfile cert/cert.pem --keyfile cert/key.pem \
   --port 8443 2>&1 | tee live_server.log' C-m
 tmux attach -t live          # detach with ctrl-b d
@@ -134,6 +142,17 @@ All in `demo/server.py` unless noted. None need changing to run it.
 | `DETECT_HZ` | 25 | How often faces are detected. |
 | `SPEAKER_CAPACITY` | 6 | Rows the buffers hold (`demo/tracker.py`). |
 | `NEW_SPEAKER_COST` | 0.78 | Above this, a face is somebody new (`demo/tracker.py`). |
+| `SHIFT_SCALE_MIN/MAX` | 0.25, 8.0 | Range the page's shift-scale slider may ask for. |
+
+The **shift scale** is the one knob the page itself moves. It is the
+`shift_scale` argument of `ProjectionWindow.get_shift_hold`: the weight put on
+the shift row of `p_future` before the two rows are renormalised, so 1 is the
+plain readout and the window's own default - 2 for the role modes - is where
+the slider starts. Moving it sends the new value over the websocket and the
+server applies it to the next forward pass; what is already on the strip keeps
+the scale it was read at, and the change rolls in from the right edge. The
+model, its weights and its logits are untouched - this only moves where the 0.5
+threshold falls on them.
 
 Two things worth knowing before changing anything:
 

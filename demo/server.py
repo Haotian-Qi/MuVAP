@@ -23,6 +23,7 @@ there is no second inference path to keep honest.
 
 import asyncio
 import json
+import math
 import os
 import time
 import traceback
@@ -31,7 +32,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data.media import ASD_MAX_GAIN_DB, ASD_PEAK_LIMIT, ASD_TARGET_RMS_DBFS  # noqa: E402
 from demo.streaming import StreamingEncoders  # noqa: E402
 from demo.tracker import SPEAKER_CAPACITY, LiveTracker, crop_face  # noqa: E402
-from models.muvap import MultiModalVAP, frozen_pair  # noqa: E402
+from models.muvap import frozen_pair, load_fusion  # noqa: E402
 from projection_window import ProjectionWindow  # noqa: E402
 
 FPS = 25
@@ -52,6 +52,11 @@ FACE = 112
 
 CONTEXT_SEC = 10.0
 CONTEXT_FRAMES = int(CONTEXT_SEC * FPS)
+#: Range the page may move `shift_scale` over. It multiplies the shift row
+#: before the rows are renormalised, so 1.0 is the plain readout and the
+#: bounds are only there to keep a stray control message from pinning
+#: p(shift) flat at 0 or 1.
+SHIFT_SCALE_MIN, SHIFT_SCALE_MAX = 0.25, 8.0
 #: The model's own rate. Re-running the whole window costs 44 ms and would cap
 #: this at ~20 Hz; caching the per-frame visual features (demo/streaming.py)
 #: takes it to about 20 ms, which leaves room at 25.
@@ -133,6 +138,10 @@ class Session:
         self.frames_seen = 0
         self.last_detect = 0.0
         self.lock = asyncio.Lock()
+        # The readout knob, not a model weight: it reweights the shift row of
+        # p_future before the 0.5 threshold, so the page can be moved off the
+        # window's own default without restarting the demo.
+        self.shift_scale = models["window"].default_shift_scale
 
     def fold_encoded(self):
         """Keep the feature cache aligned when the crop ring folds back."""
@@ -271,7 +280,7 @@ class Session:
         t_fwd = time.perf_counter()
 
         shift = self.models["window"].get_shift_hold(
-            global_logits[0, 0].float().cpu()
+            global_logits[0, 0].float().cpu(), shift_scale=self.shift_scale
         )["p_shift"].numpy()
         activity = speaker_logits[0, :, :, 0].sigmoid().float().cpu().numpy()
         done = time.perf_counter()
@@ -342,16 +351,9 @@ def cap_onnx_threads(threads: int) -> None:
     ort.InferenceSession._muvap_capped = True
 
 
-def load_models(vap_weights, asd_weights, checkpoint, config, device):
+def load_models(vap_weights, asd_weights, muvap_weights, config, device):
     encoders = frozen_pair(vap_weights, asd_weights).to(device).eval()
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    cfg = state.get("hyper_parameters", {}).get("muvap") or yaml.safe_load(
-        open(config)
-    )["muvap"]
-    fusion = MultiModalVAP(cfg)
-    fusion.load_state_dict(
-        {k[6:]: v for k, v in state["state_dict"].items() if k.startswith("model.")}
-    )
+    fusion, cfg = load_fusion(muvap_weights, config)
     providers = gpu_detector_providers()
     on_gpu = providers[0] == "CUDAExecutionProvider"
     if not on_gpu:
@@ -452,6 +454,7 @@ async def stream(socket: WebSocket):
                     [round(float(x), 4) for x in activity[s][-new:]] for s in seated
                 ],
                 "capacity": SPEAKER_CAPACITY,
+                "shift_scale": round(session.shift_scale, 3),
                 "tracks": [
                     {"speaker": t["speaker"], "bbox": t["bbox"]}
                     for t in session.tracks if t["bbox"]
@@ -512,8 +515,20 @@ async def stream(socket: WebSocket):
                     )
                     if frame is not None:
                         session.push_frame(frame)
-            elif message.get("text") == "close":
-                break
+            elif message.get("text") is not None:
+                if message["text"] == "close":
+                    break
+                # Control messages are the only text the page sends. A bad one
+                # is ignored rather than fatal: the demo keeps predicting at
+                # whatever scale it already had.
+                try:
+                    control = json.loads(message["text"])
+                    wanted = float(control["shift_scale"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                if math.isfinite(wanted):
+                    session.shift_scale = min(max(wanted, SHIFT_SCALE_MIN),
+                                              SHIFT_SCALE_MAX)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
@@ -529,7 +544,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vap-weights", required=True)
     parser.add_argument("--asd-weights", required=True)
-    parser.add_argument("--checkpoint", required=True, help="a trained MuVAP .ckpt")
+    parser.add_argument(
+        "--muvap-weights", required=True,
+        help="published MuVAP release, or a training .ckpt",
+    )
     parser.add_argument("--config", default=HERE.parent / "config/yaml/muvap.yaml")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8443)
@@ -539,7 +557,7 @@ def main():
     args = parser.parse_args()
 
     STATE["models"] = load_models(
-        args.vap_weights, args.asd_weights, args.checkpoint, args.config, args.device
+        args.vap_weights, args.asd_weights, args.muvap_weights, args.config, args.device
     )
     print(f"models ready on {args.device}; {CONTEXT_SEC:g}s context at {INFER_HZ} Hz")
     uvicorn.run(

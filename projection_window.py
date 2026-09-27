@@ -100,6 +100,11 @@ class ProjectionWindow:
     def is_role_based(self):
         return self.mode in ROLE_MODES
 
+    @property
+    def default_shift_scale(self):
+        """The weight `get_shift_hold` puts on the shift row unasked."""
+        return 2.0 if self.is_role_based else 1.0
+
     # ---------------------------------------------------------------- codebook
 
     @staticmethod
@@ -337,7 +342,7 @@ class ProjectionWindow:
             rows = self.as_hold_shift(rows, prev_speaker)
 
         if shift_scale is None:
-            shift_scale = 2.0 if self.is_role_based else 1.0
+            shift_scale = self.default_shift_scale
         scaled = rows.clone()
         scaled[..., 1] *= shift_scale
         shift = scaled[..., 1] / scaled.sum(dim=-1).clamp_min(1e-8)
