@@ -1,8 +1,14 @@
-"""Causal transformer stack.
+"""Transformer blocks for the VAP, ASD, and MuVAP stacks.
 
-Frame `t` attends to frames `<= t` only, which is what makes a trained model
-usable as a streaming turn-taking predictor. How position reaches attention is
-configurable through `pos_encoding`; the visibility rule is not.
+The temporal stacks are causal: frame `t` attends to frames `<= t` only, which
+is what makes a trained model usable as a streaming turn-taking predictor. How
+position reaches attention is configurable through `pos_encoding`; the
+visibility rule is not.
+
+`FrameTemporalEncoder` is the multiparty half. It alternates two views of the
+same tensor: attention *across speakers* inside one frame, where the speakers
+carry no order and no position, and attention *along time* on the fused frame
+sequence, where both still apply.
 """
 
 import torch
@@ -23,6 +29,10 @@ from .positional import (
 class TransformerModel(nn.Module):
     """Stack of pre-norm transformer layers over a `[batch, frames, dim]` sequence."""
 
+    #: A frame-wise stack attends across speakers, whose order is arbitrary, so
+    #: it builds neither a rotary embedding nor an input position table.
+    uses_position = True
+
     def __init__(self, cfg, cross_attention=False):
         super().__init__()
         self.dim = cfg["d_model"]
@@ -42,14 +52,16 @@ class TransformerModel(nn.Module):
                 f"pos_encoding must be one of {POS_ENCODINGS}, got {self.pos_encoding!r}"
             )
 
-        self.rope = (
-            RotaryEmbedding(self.dim // self.num_heads, max_frames=self.max_frames)
-            if self.pos_encoding == "rope"
-            else None
-        )
-        self.input_pos = build_input_position_embedding(
-            self.pos_encoding, self.dim, self.max_frames
-        )
+        self.rope = None
+        self.input_pos = None
+        if self.uses_position:
+            if self.pos_encoding == "rope":
+                self.rope = RotaryEmbedding(
+                    self.dim // self.num_heads, max_frames=self.max_frames
+                )
+            self.input_pos = build_input_position_embedding(
+                self.pos_encoding, self.dim, self.max_frames
+            )
 
         self._build_layers()
         self.apply(self._init_weights)
@@ -88,6 +100,169 @@ class TransformerModel(nn.Module):
             x = self.input_pos(x)
         for layer in self.layers:
             x = layer(x, src, mask=mask)
+        return x
+
+
+class FrameTemporalEncoder(nn.Module):
+    """Fuse one global stream with a variable number of per-speaker streams.
+
+    The two streams are told apart by a learned type embedding rather than by
+    position, because they are not two points on one timeline: `vap` is the
+    conversation heard as a whole, `asd` is what each visible speaker is doing.
+    The embedding starts at zero, so an untrained encoder sees exactly the
+    features its two frozen sources produced.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.ft = FrameTemporalBlock(cfg["frame"], cfg["temporal"])
+
+        model_dim = cfg["temporal"]["d_model"]
+        self.type_embed = nn.Embedding(2, model_dim)
+        nn.init.zeros_(self.type_embed.weight)
+
+    def forward(self, vap, asd, speaker_mask=None):
+        device = asd.device
+        vap = vap + self.type_embed(torch.tensor(0, device=device))
+        asd = asd + self.type_embed(torch.tensor(1, device=device))
+
+        vap, asd = self.ft(vap, asd, speaker_mask=speaker_mask)
+
+        return vap, asd
+
+
+#: Folded frames handled per frame-attention call. Attention inside a frame is
+#: independent of every other frame, so the split changes nothing numerically -
+#: it only stops `batch x frames` from becoming one enormous attention problem.
+#: A 32-minute validation segment folds to 48k frames, which overruns the CUDA
+#: grid and then memory; the loop keeps each call the same size whatever arrives.
+FRAME_CHUNK = 8192
+
+
+class FrameTemporalBlock(nn.Module):
+    """One frame-wise read across speakers, then one causal pass along time.
+
+    Doing it in that order is what keeps the model usable on a conversation
+    with any number of visible speakers: the speaker axis is consumed inside a
+    frame, where it is a set, and only the fused `[batch, frames, dim]` stream
+    reaches the temporal stack, where order and causality mean something.
+    """
+
+    def __init__(self, f_cfg, t_cfg):
+        super().__init__()
+        self.vap_frame = FrameTransformerModel(f_cfg)
+        self.vap_temporal = TransformerModel(t_cfg)
+
+    def forward(self, vap, asd, speaker_mask=None):
+        B, S, T, D = asd.shape
+
+        # Every frame of every item becomes its own one-query attention problem,
+        # which is what lets one batch hold conversations of differing length
+        # without the speaker axis leaking across frames.
+        q_vap = vap.permute(0, 2, 1, 3).reshape(B * T, 1, D)
+        kv_asd = asd.permute(0, 2, 1, 3).reshape(B * T, S, D)
+
+        mask = None
+        if speaker_mask is not None:
+            if speaker_mask.shape != (B, S, T):
+                raise ValueError(
+                    "speaker_mask must have shape [batch, speakers, frames]"
+                )
+            mask = speaker_mask.permute(0, 2, 1).reshape(B * T, 1, 1, S)
+            # A frame where no face is visible would otherwise attend to nothing
+            # and come back NaN. Opening every key there is the honest fallback:
+            # the padded rows are the model's own zeros, not another speaker.
+            empty = ~mask.any(dim=-1, keepdim=True)
+            mask = mask | empty
+
+        folded = []
+        for start in range(0, B * T, FRAME_CHUNK):
+            stop = start + FRAME_CHUNK
+            folded.append(
+                self.vap_frame(
+                    x=q_vap[start:stop],
+                    src=kv_asd[start:stop],
+                    mask=None if mask is None else mask[start:stop],
+                )
+            )
+        vap_in = (folded[0] if len(folded) == 1 else torch.cat(folded)).reshape(B, T, D)
+        vap_out = self.vap_temporal(vap_in).reshape(B, 1, T, D)
+
+        return vap_out, asd
+
+
+class FrameTransformerModel(nn.Module):
+    """A `FrameTransformer` that always reads a source stream."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.transformer = FrameTransformer(cfg)
+
+    def forward(self, x, src, mask=None):
+        return self.transformer(x=x, src=src, mask=mask)
+
+
+class FrameTransformer(TransformerModel):
+    """Attends across speakers inside one frame, where there is no position."""
+
+    uses_position = False
+
+    def _build_layers(self):
+        self.layers = nn.ModuleList(
+            [
+                FrameLayer(
+                    dim=self.dim,
+                    ffn_dim=self.dff,
+                    num_heads=self.num_heads,
+                    ffn_activation=self.activation,
+                    dropout=self.dropout,
+                    norm_type=self.norm_type,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+
+
+class FrameLayer(nn.Module):
+    """Cross-attention over speakers within one frame; order carries no meaning.
+
+    Unlike `TransformerLayer` this has no self-attention over the query: a
+    frame holds one query and the speakers are the source, so attending the
+    query to itself would add nothing.
+    """
+
+    def __init__(
+        self,
+        dim,
+        ffn_dim,
+        num_heads,
+        ffn_activation="GELU",
+        dropout=0.1,
+        norm_type="layer",
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.ln_self_attn = build_norm(norm_type, dim)
+        self.ln_kv = build_norm(norm_type, dim)
+        self.ln_ffnetwork = build_norm(norm_type, dim)
+
+        self.mha = MultiHeadAttention(
+            dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            causal=False,
+            pos_encoding="none",
+        )
+        self.ffnetwork = ffn_block(
+            dim, ffn_dim, activation=ffn_activation, dropout=dropout
+        )
+
+    def forward(self, x, src=None, mask=None):
+        z = self.ln_self_attn(x)
+        src_norm = self.ln_kv(src)
+
+        x = x + self.dropout(self.mha(Q=z, K=src_norm, V=src_norm, mask=mask))
+        x = x + self.dropout(self.ffnetwork(self.ln_ffnetwork(x)))
         return x
 
 

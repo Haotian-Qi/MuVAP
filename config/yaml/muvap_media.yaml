@@ -1,0 +1,88 @@
+# MuVAP on raw media: the frozen modules run on every batch instead of being
+# read out of an embedding pack. Same model and same targets as muvap.yaml -
+# only where the two streams come from differs.
+checkpoint_dir: runs/muvap_media
+
+packed_muvap:
+  train:
+    - data/AVCC/packed/segments.train
+  val:
+    - data/AVCC/packed/segments.val
+  test:
+    - data/AVCC/packed/events.test
+
+muvap:
+  source: media
+  # Published releases, loaded into the frozen pair before it is frozen. Without
+  # these the encoders would be freshly initialised and the run would be fitting
+  # the fusion to noise, so they are required rather than optional.
+  vap_weights: weights/vap-role-cpc
+  asd_weights: weights/asd-cpc
+
+  num_workers: 12
+  max_epochs: 5
+  seed: 0
+
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  matmul_precision: high
+  checkpoint_monitor: val/loss
+  checkpoint_mode: min
+
+  # 30 s windows overlapping by 10 s, as on the embedding path.
+  train_window: 750
+  train_overlap: 250
+  # Far smaller than the embedding path's 16: a batch here carries
+  # batch x speakers x 750 face crops through the ASD frontend, which is what
+  # bounds memory. Measured on a 24 GB card, 8 x 3 x 750 peaks at 18.4 GB.
+  batch_size: 6
+  val_frame_budget: 4096
+  val_max_batch: 4
+  min_batch: 1
+  max_batch: 6
+
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  min_lr: 0.0001
+
+  vap_dim: 256
+  asd_dim: 512
+
+  gvap_projection_window:
+    bin_sec: [1.4, 0.6, 0.6, 1.4]
+    num_hist_bins: 2
+    frame_hz: 25
+    threshold: 0.5
+    mode: role_relative
+    cut_center_frame: false
+
+  svap_projection_window:
+    bin_sec: [0.2, 0.4, 0.6, 0.8]
+    num_hist_bins: 0
+    frame_hz: 25
+    threshold: 0.5
+    mode: independent
+    cut_center_frame: false
+
+  frame:
+    d_model: 256
+    m_ff: 4
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+
+  temporal:
+    d_model: 256
+    m_ff: 4
+    n_heads: 4
+    n_layers: 1
+    dropout: 0.1
+    activation: GELU
+    causal: true
+    pos_encoding: alibi
+    ffn: mlp
+    norm: layer
+    max_frames: 4096

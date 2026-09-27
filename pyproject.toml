@@ -30,7 +30,7 @@ wandb = ["wandb>=0.19"]
 
 [tool.setuptools]
 # One entry point per module. They share the packages found below.
-py-modules = ["projection_window", "train_vap", "train_asd"]
+py-modules = ["projection_window", "train_vap", "train_asd", "train_muvap"]
 
 [tool.setuptools.packages.find]
 include = ["config*", "data*", "models*", "preprocess*", "tasks*", "tools*"]

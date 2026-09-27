@@ -1,0 +1,343 @@
+<title>MuVAP live</title>
+<style>
+  :root{--bg:#faf9f7;--ink:#1b1a18;--muted:#6f6b66;--line:#e0dbd4;--panel:#fff;
+        --pred:#2f7d5d;--idle:#ece8e2;--hot:#c8442c;--cool:#b9b5ae;--mark:#d62828}
+  @media(prefers-color-scheme:dark){:root:not([data-theme=light]){
+        --bg:#141417;--ink:#eeece9;--muted:#9a958e;--line:#33322f;--panel:#1d1d21;
+        --idle:#2a2a2f;--cool:#4a4842}}
+  body{background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;
+       margin:0 auto;max-width:1000px;padding-block:20px;padding-left:16px;padding-right:16px}
+  h1{font-size:17px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+         padding:12px;margin-bottom:12px}
+  .stage{position:relative;line-height:0}
+  video{width:100%;border-radius:6px;display:block;background:#000;transform:scaleX(-1)}
+  canvas#ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;
+            transform:scaleX(-1)}
+  .faces{display:flex;gap:12px;justify-content:center;margin-top:12px;min-height:132px}
+  .face{text-align:center}
+  .face canvas{width:104px;height:104px;border-radius:8px;border:3px solid var(--cool);
+               image-rendering:pixelated;display:block;background:#888;transform:scaleX(-1)}
+  .face.on canvas{border-color:var(--pred)}
+  .face.off canvas{border-color:var(--hot)}
+  .face .nm{font-size:12px;margin-top:5px;color:var(--muted)}
+  .face .nm b{color:var(--ink)}
+  canvas#strip{width:100%;height:auto;display:block}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  button{font:inherit;padding:7px 16px;border-radius:7px;border:1px solid var(--line);
+         background:var(--panel);color:var(--ink);cursor:pointer}
+  button.go{background:var(--pred);color:#fff;border-color:transparent}
+  button:disabled{opacity:.45;cursor:default}
+  .stat{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+  .legend{color:var(--muted);font-size:12px;margin-top:8px;display:flex;gap:16px;flex-wrap:wrap}
+  .sw{display:inline-block;width:22px;height:9px;border-radius:2px;vertical-align:middle;margin-right:5px}
+  .warn{background:#c8442c15;border:1px solid #c8442c55;color:var(--ink);
+        border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:13px}
+</style>
+
+<h1>MuVAP live</h1>
+<p class="sub" id="sub">camera and microphone, predicted in real time — nothing here is annotated</p>
+<div class="warn" id="warn" hidden></div>
+
+<div class="panel">
+  <div class="row">
+    <button class="go" id="start">Start camera</button>
+    <button id="stop" disabled>Stop</button>
+    <span class="stat" id="stat">idle</span>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="stage"><video id="v" autoplay playsinline muted></video><canvas id="ov"></canvas></div>
+  <div class="faces" id="faces"></div>
+</div>
+
+<div class="panel">
+  <canvas id="strip"></canvas>
+  <div class="row" style="margin-top:10px">
+    <label for="sscale" class="stat">shift scale</label>
+    <input type="range" id="sscale" min="-2" max="3" step="0.05" value="1"
+           style="flex:1;min-width:140px">
+    <span class="stat" id="sscaleVal">2.00</span>
+    <button id="sscaleReset" style="padding:3px 10px;font-size:12px">default</button>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--hot)"></i>p(shift) above 0.5</span>
+    <span><i class="sw" style="background:var(--cool)"></i>below 0.5</span>
+    <span><i class="sw" style="background:var(--pred)"></i>predicted speech (SVAP bin 1)</span>
+    <span>every value is a model output, read at the shift scale below</span>
+  </div>
+</div>
+
+<script>
+const FPS = 25, WIN_SEC = 10, WIN = WIN_SEC * FPS;
+/* Rows are not fixed. The server says which speakers it currently holds and a
+   row appears the first time one is seated; `CAP` is only the ceiling its
+   buffers are sized for. A speaker who leaves keeps their row, because they
+   keep their identity and get it back on sight. */
+let CAP = 6, shown = [];
+const v = document.getElementById("v"), ov = document.getElementById("ov");
+const og = ov.getContext("2d");
+const strip = document.getElementById("strip"), g = strip.getContext("2d");
+const css = getComputedStyle(document.documentElement), col = k => css.getPropertyValue(k).trim();
+const warn = document.getElementById("warn"), stat = document.getElementById("stat");
+
+/* rolling history of what the model said, one slot per model frame */
+const SAMPLES_PER_FRAME = 16000 / FPS;   // one model frame of audio
+const shift = new Float32Array(WIN).fill(0);
+const act = [];
+const row = s => (act[s] || (act[s] = new Float32Array(WIN).fill(0)));
+const seen = new Uint8Array(WIN);
+let tracks = [], faceCells = new Map(), ws = null, stream = null, ctxAudio = null, timer = null;
+let frames = 0, latency = 0, sentF = 0, sentA = 0;
+
+function shiftIn(arr, value) { arr.copyWithin(0, 1); arr[WIN - 1] = value; }
+
+/* ---- shift scale -------------------------------------------------------
+   The weight `get_shift_hold` puts on the shift row before the two rows are
+   renormalised, so 1 is the plain readout and the window's own default (2 for
+   the role modes) is what the server starts on. It is applied server-side, on
+   the model's logits - moving it does not rescale what is already drawn, the
+   new setting arrives with the next prediction and rolls in from the right.
+   The slider travels in powers of two, because the useful range is a ratio. */
+let sScale = null, sDefault = null;
+const sscale = document.getElementById("sscale"), sscaleVal = document.getElementById("sscaleVal");
+function showScale(v) { sscaleVal.textContent = v.toFixed(2); sscale.value = Math.log2(v); }
+function sendScale(v) {
+  sScale = v; showScale(v);
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ shift_scale: v }));
+}
+sscale.oninput = () => sendScale(2 ** +sscale.value);
+document.getElementById("sscaleReset").onclick = () => { if (sDefault !== null) sendScale(sDefault); };
+
+/* ---- timeline ---------------------------------------------------------- */
+const ROW = 22, GAP = 6, PAD = 78, RIGHT = 12, PROB = 76;
+const W = 980;
+/* The strip grows a lane per speaker, so its height follows the roster. */
+const stripH = n => PROB + GAP + Math.max(n, 1) * (ROW + GAP) + 22;
+strip.width = W; strip.height = stripH(0);
+const PLOT = W - PAD - RIGHT, PPF = PLOT / WIN;
+
+function drawStrip() {
+  const want = stripH(shown.length);
+  if (strip.height !== want) strip.height = want;   /* also clears; redrawn below */
+  const H = strip.height;
+  g.fillStyle = col("--panel"); g.fillRect(0, 0, W, H);
+  const top = 4, bot = top + PROB, mid = top + PROB * 0.5;
+  const x = t => PAD + t * PPF;
+  const area = () => {
+    g.beginPath(); g.moveTo(x(0), bot);
+    for (let t = 0; t < WIN; t++) g.lineTo(x(t), bot - shift[t] * PROB);
+    g.lineTo(x(WIN - 1), bot); g.closePath();
+  };
+  g.save(); g.beginPath(); g.rect(PAD, mid, PLOT, bot - mid); g.clip();
+  area(); g.fillStyle = col("--cool"); g.globalAlpha = .55; g.fill(); g.restore(); g.globalAlpha = 1;
+  g.save(); g.beginPath(); g.rect(PAD, top, PLOT, mid - top); g.clip();
+  area(); g.fillStyle = col("--hot"); g.globalAlpha = .85; g.fill(); g.restore(); g.globalAlpha = 1;
+
+  g.strokeStyle = col("--ink"); g.lineWidth = 1.5; g.beginPath();
+  for (let t = 0; t < WIN; t++) { const y = bot - shift[t] * PROB; t ? g.lineTo(x(t), y) : g.moveTo(x(t), y); }
+  g.stroke();
+  g.setLineDash([5, 4]); g.strokeStyle = col("--muted"); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(PAD, mid); g.lineTo(PAD + PLOT, mid); g.stroke(); g.setLineDash([]);
+  g.fillStyle = col("--muted"); g.font = "11px system-ui,sans-serif"; g.textAlign = "right";
+  g.fillText("p(shift)", PAD - 8, top + 12); g.fillText("0.5", PAD - 8, mid + 4);
+
+  let y = bot + GAP;
+  for (const s of shown) {
+    const a = row(s);
+    g.fillStyle = col("--idle"); g.fillRect(PAD, y, PLOT, ROW);
+    g.fillStyle = col("--pred");
+    for (let t = 0; t < WIN; t++) if (seen[t] && a[t] > 0.5) g.fillRect(x(t), y, Math.ceil(PPF) + .5, ROW);
+    g.fillStyle = col("--muted"); g.textAlign = "right";
+    g.fillText("speaker " + s, PAD - 8, y + ROW - 6);
+    y += ROW + GAP;
+  }
+  if (!shown.length) {
+    g.fillStyle = col("--idle"); g.fillRect(PAD, y, PLOT, ROW);
+    g.fillStyle = col("--muted"); g.textAlign = "right";
+    g.fillText("no speaker yet", PAD - 8, y + ROW - 6);
+    y += ROW + GAP;
+  }
+  /* now is the right edge: the window scrolls left as time passes */
+  g.fillStyle = col("--mark"); g.fillRect(PAD + PLOT - 2, top, 2.5, y - GAP - top);
+  g.fillStyle = col("--muted"); g.textAlign = "center";
+  for (let s = 0; s <= WIN_SEC; s++) g.fillText((s - WIN_SEC) + "s", PAD + s * FPS * PPF, H - 4);
+}
+
+/* ---- faces and boxes --------------------------------------------------- */
+/* A thumbnail is built the first time a speaker is seated, and kept after they
+   leave - the tracker keeps their identity, so the row is still theirs. */
+function syncFaces() {
+  const host = document.getElementById("faces");
+  for (const s of shown) {
+    if (faceCells.has(s)) continue;
+    const w = document.createElement("div"); w.className = "face";
+    const c = document.createElement("canvas"); c.width = 112; c.height = 112;
+    const n = document.createElement("div"); n.className = "nm";
+    w.append(c, n); host.append(w);
+    faceCells.set(s, { w, c, ctx: c.getContext("2d"), n });
+  }
+}
+
+const grab = document.createElement("canvas"), gg = grab.getContext("2d");
+function paintFaces() {
+  for (const s of shown) {
+    const cell = faceCells.get(s); if (!cell) continue;
+    const tr = tracks.find(t => t.speaker === s);
+    const on = row(s)[WIN - 1] > 0.5;
+    cell.w.className = "face " + (tr ? (on ? "on" : "off") : "");
+    cell.n.innerHTML = tr
+      ? `<b>speaker ${s}</b><br>${on ? "speaking" : "silent"} · p=${row(s)[WIN - 1].toFixed(2)}`
+      : `<b>speaker ${s}</b><br>away`;
+    if (tr && v.videoWidth) {
+      const [x1, y1, x2, y2] = tr.bbox;
+      const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, half = Math.max(x2 - x1, y2 - y1) / 2;
+      cell.ctx.drawImage(v, cx - half, cy - half, half * 2, half * 2, 0, 0, 112, 112);
+    }
+  }
+}
+
+function paintBoxes() {
+  if (!ov.width) return;
+  og.clearRect(0, 0, ov.width, ov.height);
+  for (const tr of tracks) {
+    const [x1, y1, x2, y2] = tr.bbox, on = row(tr.speaker)[WIN - 1] > 0.5;
+    og.strokeStyle = on ? col("--pred") : col("--hot");
+    og.lineWidth = Math.max(2, ov.width / 380);
+    og.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    const label = `${tr.speaker}  ${row(tr.speaker)[WIN - 1].toFixed(2)}`;
+    og.font = `${Math.round(ov.width / 55)}px system-ui,sans-serif`;
+    const h = ov.width / 42, w = og.measureText(label).width + 10;
+    og.fillStyle = on ? col("--pred") : col("--hot");
+    og.fillRect(x1, Math.max(0, y1 - h), w, h);
+    og.save(); og.scale(-1, 1);                      /* labels unmirrored */
+    og.fillStyle = "#fff"; og.textAlign = "left";
+    og.fillText(label, -(x1 + w) + 5, Math.max(0, y1 - h) + h * 0.76);
+    og.restore();
+  }
+}
+
+/* ---- capture ----------------------------------------------------------- */
+async function start() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return show("This browser will not open a camera on an insecure origin. "
+      + "Use the https link, or http://localhost via an SSH tunnel.");
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 25 } },
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false },
+    });
+  } catch (e) { return show("Camera or microphone refused: " + e.message); }
+
+  v.srcObject = stream;
+  await v.play().catch(() => {});
+  ov.width = v.videoWidth || 640; ov.height = v.videoHeight || 360;
+  grab.width = ov.width; grab.height = ov.height;
+  syncFaces();
+
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    /* one slot per model frame, so the window really is 10 s wide */
+    if (m.capacity) CAP = m.capacity;
+    /* The server reports the scale it actually used, which is the window's own
+       default until the slider is moved; the slider's ends are the server's
+       bounds, so nothing it sends back can disagree with what is shown. */
+    if (m.shift_scale != null) {
+      if (sDefault === null) sDefault = m.shift_scale;
+      if (sScale === null) { sScale = m.shift_scale; showScale(sScale); }
+    }
+    /* A speaker who appears gets a row; one who leaves keeps theirs. */
+    let fresh = false;
+    for (const s of m.speakers || []) if (!shown.includes(s)) { shown.push(s); fresh = true; }
+    if (fresh) { shown.sort((a, b) => a - b); syncFaces(); }
+    for (let k = 0; k < m.n; k++) {
+      shiftIn(shift, m.shift[k] ?? m.shift[m.shift.length - 1]);
+      for (const s of shown) {
+        const i = (m.speakers || []).indexOf(s);
+        /* A row the server did not send is a speaker it is not holding this
+           frame, which reads as silent rather than as a gap. */
+        const r = i < 0 ? null : m.activity[i];
+        shiftIn(row(s), r ? (r[k] ?? r[r.length - 1] ?? 0) : 0);
+      }
+      seen.copyWithin(0, 1); seen[WIN - 1] = 1;
+    }
+    tracks = m.tracks; frames = m.frames; latency = m.latency_ms;
+  };
+  ws.onopen = () => { if (sScale !== null) ws.send(JSON.stringify({ shift_scale: sScale })); };
+  ws.onclose = () => stop();
+
+  /* audio: the server's clock, so it must be continuous */
+  ctxAudio = new AudioContext({ sampleRate: 16000 });
+  const src = ctxAudio.createMediaStreamSource(stream);
+  /* One message per model frame, not one per render quantum. The worklet is
+     called with 128 samples at a time; sending each would be 125 websocket
+     messages a second, and the server's event loop has to decrypt and unpack
+     every one of them on the same thread that hands results back from the
+     model - which showed up as an 8 ms tail on the forward pass. Batching to
+     640 samples is also exactly one model frame, so a message never straddles
+     the clock. */
+  const code = `const N=${SAMPLES_PER_FRAME};
+    class P extends AudioWorkletProcessor{
+      constructor(){super();this.buf=new Float32Array(N);this.n=0}
+      process(i){const a=i[0][0];if(!a)return true;
+        let o=0;while(o<a.length){const k=Math.min(N-this.n,a.length-o);
+          this.buf.set(a.subarray(o,o+k),this.n);this.n+=k;o+=k;
+          if(this.n===N){this.port.postMessage(this.buf.slice());this.n=0}}
+        return true}}
+    registerProcessor('tap',P)`;
+  await ctxAudio.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+  const node = new AudioWorkletNode(ctxAudio, "tap");
+  node.port.onmessage = e => {
+    if (ws?.readyState !== 1) return;
+    const buf = new Uint8Array(1 + e.data.byteLength);
+    buf[0] = 1; buf.set(new Uint8Array(e.data.buffer), 1);
+    ws.send(buf); sentA++;
+  };
+  src.connect(node); node.connect(ctxAudio.destination);
+
+  timer = setInterval(sendFrame, 1000 / FPS);
+  document.getElementById("start").disabled = true;
+  document.getElementById("stop").disabled = false;
+  show(null);
+}
+
+function sendFrame() {
+  if (ws?.readyState !== 1 || !v.videoWidth) return;
+  gg.drawImage(v, 0, 0, grab.width, grab.height);
+  grab.toBlob(async b => {
+    if (!b || ws?.readyState !== 1) return;
+    const bytes = new Uint8Array(await b.arrayBuffer());
+    const out = new Uint8Array(1 + bytes.length); out[0] = 2; out.set(bytes, 1);
+    ws.send(out); sentF++;
+  }, "image/jpeg", 0.6);
+}
+
+function stop() {
+  clearInterval(timer); timer = null;
+  ws?.close(); ws = null;
+  ctxAudio?.close(); ctxAudio = null;
+  stream?.getTracks().forEach(t => t.stop()); stream = null;
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
+  stat.textContent = "stopped";
+}
+
+function show(text) { warn.hidden = !text; if (text) warn.textContent = text; }
+document.getElementById("start").onclick = start;
+document.getElementById("stop").onclick = stop;
+
+function loop() {
+  drawStrip();
+  if (faceCells.size) { paintFaces(); paintBoxes(); }
+  if (ws) stat.textContent =
+    `${frames} frames of context (${(frames / FPS).toFixed(1)}s) · inference ${latency} ms `
+    + `· ${tracks.length} of ${shown.length} speaker${shown.length === 1 ? "" : "s"} in frame`;
+  requestAnimationFrame(loop);
+}
+drawStrip(); loop();
+</script>

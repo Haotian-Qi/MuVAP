@@ -37,6 +37,10 @@ def build_model(cfg, module):
         from models.asd import AudioVisualASD
 
         return AudioVisualASD(cfg["asd"])
+    if module == "muvap":
+        from models.muvap import MultiModalVAP
+
+        return MultiModalVAP(cfg["muvap"])
     from models.vap import build_vap
 
     return build_vap(cfg["vap"])
@@ -50,7 +54,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint")
     parser.add_argument("output", help="destination directory")
-    parser.add_argument("--module", choices=("vap", "asd"), default="vap")
+    parser.add_argument("--module", choices=("vap", "asd", "muvap"), default="vap")
     parser.add_argument(
         "--keep-frozen",
         action="store_true",
