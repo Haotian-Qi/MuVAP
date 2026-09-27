@@ -6,13 +6,10 @@ per-frame boxes in `bbox/<video>/<segment>.csv`, speaker activity in
 one flat file. This module resolves that layout and decodes it; the writer owns
 every media transformation, and nothing here normalizes a signal.
 
-Speaker activity is annotated twice, and the two layers are read as one:
-`rttm_finegrind` holds the segments that have been through forced alignment and
-supersedes `rttm` for those, while `rttm` carries everything else. A segment is
-a segment if either layer names it.
+A segment is a segment if `rttm/` names it.
 
-The speaker roster of a segment is the union of the annotation layers, not
-either one alone. A speaker who is heard but never tracked still has to occupy
+The speaker roster of a segment is the union of its boxes and its activity
+file, not either one alone. A speaker who is heard but never tracked still has to occupy
 a row, because the global label is defined over everyone in the conversation -
 the model simply sees a blank face there and the visibility flag says why.
 """
@@ -44,13 +41,8 @@ BLANK_FACE = 128
 VIDEO_DIRS = ("orig_video", "videos", "../orig_video", "../videos")
 AUDIO_DIR = "orig_audio"
 
-#: Where speaker activity is read from, best first. The corpus annotates it
-#: twice and the layers are one source, not a choice: a segment present in
-#: `rttm_finegrind` has been through forced alignment and supersedes whatever
-#: `rttm` says about it, and `rttm` is what every other segment has. Reading
-#: them in this order *is* the merge - there is no coarse-or-fine decision to
-#: make, only a better annotation where one exists.
-VAD_LAYERS = ("rttm_finegrind", "rttm")
+#: Where speaker activity is read from: `rttm/<video>/<segment>.rttm`.
+VAD_DIR = "rttm"
 
 
 def speaker_key(speaker: str):
@@ -110,16 +102,17 @@ def read_rttm(path: Path, source_frames: int, source_fps: float) -> dict[str, np
 def read_events(path: Path) -> dict[tuple[str, str], list[dict]]:
     """Group the flat turn-event file by the segment each event belongs to.
 
-    Seven whitespace-separated columns:
+    Eight whitespace-separated columns:
 
     ```text
-    video_id  segment_id  previous  start  duration  following  label
+    video_id  segment_id  previous  start  duration  following  label  n_speakers
     ```
 
     `start` and `duration` describe the mutual silence between the two turns,
     and `previous` and `following` are the speakers on either side of it - so a
     hold is exactly an event whose two speakers are the same one, which
-    `preprocess.muvap.validate` checks against the label.
+    `preprocess.muvap.validate` checks against the label. `n_speakers` is the
+    event's speaker count; only the benchmark scorer reads it.
     """
     events: dict[tuple[str, str], list[dict]] = defaultdict(list)
     with Path(path).open() as handle:
@@ -127,13 +120,13 @@ def read_events(path: Path) -> dict[tuple[str, str], list[dict]]:
             parts = line.split()
             if not parts:
                 continue
-            if len(parts) != 7:
+            if len(parts) != 8:
                 raise ValueError(
-                    f"{path}:{number}: expected 7 columns "
-                    "(video segment previous start duration following label), "
-                    f"got {len(parts)}"
+                    f"{path}:{number}: expected 8 columns "
+                    "(video segment previous start duration following label "
+                    f"n_speakers), got {len(parts)}"
                 )
-            video, segment, previous, start, duration, following, label = parts
+            video, segment, previous, start, duration, following, label = parts[:7]
             events[(video, segment)].append(
                 {
                     "gap_start": float(start),
@@ -355,27 +348,16 @@ def audio_path(root: Path, video_id: str, segment_id: str, recording: Path) -> P
     return wav if wav.exists() else recording
 
 
-def vad_path(root: Path, video_id: str, segment_id: str):
-    """The activity file for one segment, from the best layer that has it."""
-    for name in VAD_LAYERS:
-        candidate = Path(root) / name / video_id / f"{segment_id}.rttm"
-        if candidate.exists():
-            return candidate
-    return None
+def vad_path(root: Path, video_id: str, segment_id: str) -> Path:
+    """The activity file for one segment."""
+    return Path(root) / VAD_DIR / video_id / f"{segment_id}.rttm"
 
 
 def segment_paths(root: Path, video_id: str) -> list[tuple[str, str]]:
-    """Every `(video, segment)` pair any activity layer names for one video.
-
-    The union, not one layer alone: the aligned pass covers segments the other
-    never got to, and a segment annotated in either is a segment.
-    """
-    segments = set()
-    for name in VAD_LAYERS:
-        directory = Path(root) / name / video_id
-        if directory.is_dir():
-            segments.update(path.stem for path in directory.glob("*.rttm"))
-    return [(video_id, segment) for segment in sorted(segments)]
+    """Every `(video, segment)` pair the activity files name for one video."""
+    directory = Path(root) / VAD_DIR / video_id
+    segments = directory.glob("*.rttm") if directory.is_dir() else []
+    return [(video_id, segment) for segment in sorted(path.stem for path in segments)]
 
 
 def read_splits(path: Path) -> dict[str, str]:
@@ -411,13 +393,9 @@ def open_segment(
         "video_path": recording,
         "audio_path": audio_path(root, video_id, segment_id, recording),
         "bbox_path": root / "bbox" / video_id / f"{segment_id}.csv",
+        "rttm_path": vad_path(root, video_id, segment_id),
     }
-    activity = vad_path(root, video_id, segment_id)
     missing = [str(path) for path in paths.values() if not path.exists()]
-    if activity is None:
-        missing.append(
-            f"{{{','.join(VAD_LAYERS)}}}/{video_id}/{segment_id}.rttm"
-        )
     if missing:
         raise FileNotFoundError(
             f"{video_id}/{segment_id} is missing {len(missing)} of its inputs: "
@@ -426,7 +404,6 @@ def open_segment(
     return AVCCSegments(
         video_id=video_id,
         segment_id=segment_id,
-        rttm_path=activity,
         work_dir=work_dir,
         **paths,
     )

@@ -171,6 +171,25 @@ shape. See [`docs/muvap.md`](docs/muvap.md) for
 the two projection windows, the pack format, what the batching guarantees, and
 the turn-event protocol behind the reported numbers.
 
+`--test` scores the turn events: hold or shift from the global head, and which
+visible speaker takes the floor from the speaker head. `muvap.probe` adds a
+logistic probe fitted on train-split events, and `muvap.dump_predictions`
+writes every event's prediction to a file:
+
+```bash
+python train_muvap.py --config config/yaml/muvap.yaml --test \
+    --checkpoint <run>/best.ckpt \
+    --set muvap.probe=true --set muvap.dump_predictions=muvap_dump.pt
+python tools/score_benchmark.py --muvap-dump muvap_dump.pt \
+    --events /data/AVCC/test_events.txt --out scores
+python tools/make_results_table.py --events /data/AVCC/test_events.txt \
+    --muvap scores/muvap_predictions.csv
+```
+
+`tools/vap_baseline.py` scores the VAP module alone on the same events, the
+audio-only row to compare against. [`DEMO.md`](DEMO.md) runs the model live on
+a camera and microphone.
+
 
 ## Running any module
 
@@ -217,7 +236,10 @@ Trained weights live on the Hub at
 Two ASD releases, `asd-cpc` and `asd-mimi`, scoring 90.50 and 92.04
 `mAP_official` on AVA-ActiveSpeaker. The VAP releases span three codebooks, two
 frontends and three frame rates - [docs/vap.md](docs/vap.md#released-models)
-lists them with their scores.
+lists them with their scores. Two MuVAP releases, `muvap-role-cpc` and
+`muvap-role-mimi`, each run with the frozen pair they were trained on: the two
+`-cpc` releases and the two `-mimi` releases respectively, named under
+`pairs_with` in their `provenance.json`.
 
 Fetch one, then evaluate it:
 

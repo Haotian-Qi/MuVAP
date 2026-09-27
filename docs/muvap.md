@@ -83,20 +83,11 @@ AVCC/packed/segments.train/
 
 ### Speaker activity, and who counts as a speaker
 
-AVCC annotates activity twice, and the two are read as **one merged layer**
-rather than as a choice. A segment in `rttm_finegrind/` has been through forced
-alignment, so that file supersedes whatever `rttm/` says about the same segment;
-`rttm/` carries everything else. Segment discovery is the union, because the
-aligned pass reaches segments the other never got to. Nothing selects between
-them - a better annotation simply wins where one exists.
+Speaker activity is read from `rttm/<video>/<segment>.rttm`, one file per
+segment, and a segment is a segment if `rttm/` names it.
 
-Corpus-wide that resolves 408 segments: 96 from `rttm_finegrind/`, 312 from
-`rttm/`. The aligned layer is visibly tighter where both exist - on
-`M9SWIUeAecA/seg01`, 87 turns against 82, speech 58.4% against 66.7%, apparent
-overlap 1.9% against 3.2%.
-
-A segment's roster is the union of the two annotation layers: everyone boxed and
-everyone heard. Those are not the same set. The annotation also labels voices
+A segment's roster is the union of its boxes and its activity file: everyone
+boxed and everyone heard. Those are not the same set. The annotation also labels voices
 that are never on screen - `B`, an off-screen speaker - and they matter, because
 the global label is defined over everyone audible and treating their speech as
 silence would corrupt the very thing the global head predicts. They get a row,
@@ -130,8 +121,7 @@ resolved next to `--root` and overridable with `--media-root`; `videos/` is
 accepted as the older spelling. Where a segment has no WAV, the audio is read
 from its MP4 instead - the shared loader brings either to 16 kHz mono, so a
 separate track is a convenience rather than a requirement. Add `--only <video>`
-or `--only <video>/<segment>` to pack one of them, which is what the renderer
-below wants.
+or `--only <video>/<segment>` to pack one of them.
 
 Face crops are decoded to a scratch array beside the pack and streamed into the
 shard in blocks, so they cost a fixed buffer rather than growing with the
@@ -157,16 +147,17 @@ duplicate the overlap on disk and read no faster.
 
 ### Turn events
 
-`test_events.txt` is the benchmark. Seven whitespace-separated columns:
+`test_events.txt` is the benchmark. Eight whitespace-separated columns:
 
 ```text
-video_id  segment_id  previous  start  duration  following  label
+video_id  segment_id  previous  start  duration  following  label  n_speakers
 ```
 
 `start` and `duration` describe the mutual silence between two turns, and
 `previous` and `following` are the speakers on either side of it - so a hold is
 exactly an event whose two speakers are the same one. `validate` checks that
-against the label rather than trusting either.
+against the label rather than trusting either. `n_speakers` is the event's
+speaker count, which the benchmark scorer keys its cells on.
 
 An event's window **ends where the silence begins**, so the last frame the model
 is given is the last frame of the previous speaker's turn and none of the pause
@@ -197,16 +188,12 @@ What the file holds, and what survives packing:
 | by candidate count | 933 events with 2 speakers on screen, 797 with 3 |
 | truncated windows | 55 shorter than 10 s, the shortest 7 frames |
 
-The merge is what makes that complete. `rttm/` has no file for
-`yGGsg7_xxsI/seg10`, whose 46 events would otherwise be unscorable;
-`rttm_finegrind/` covers it.
-
 Those 55 are worth knowing about when a cell looks weak: a 7-frame window is
 0.28 s of history, and nothing can do much with it. They are 3% of the
 benchmark and they are in it, rather than quietly removed to flatter the score.
 
 Batches group by speaker count and then by length, so the padding that variable
-windows cost is 1.6% of frames - see [Batching](#batching).
+windows cost is 1.6% of frames.
 
 Preprocessing fails by name on a segment missing any of its inputs rather than
 quietly skipping it; `--skip-missing` turns that into a warning, at the cost of
@@ -231,99 +218,6 @@ faces and audio and runs `FrozenEncoders` on every batch, which needs `vap:` and
 `asd:` sections in the config holding the architectures those weights were
 trained with. Both paths run the same code on the same inputs; reach for `media`
 to change or fine-tune a frozen module, and for `embeddings` otherwise.
-
-### How much history a frame was encoded with
-
-This is the one way the two paths differ, so it is worth being exact. Every
-stage is causal, so a frame's embedding depends on the history fed *when it was
-encoded*. `--window 0` encodes each segment whole and every frame gets its full
-context. Anything else - extraction in windows, or a training loader chunking a
-media pack - gives a frame near a boundary only the prefix in front of it.
-
-Largest absolute deviation from whole-segment encoding, measured on three
-synthetic segments with untrained CPC-backed modules:
-
-| | VAP | ASD | mean cosine |
-| --- | --- | --- | --- |
-| extracted whole | 0 | 0 | 1.00000 |
-| extracted, window 150, context 125 | 2.4e-02 | 5.4e-02 | 0.99999 |
-| extracted, window 150, context 50 | 7.8e-02 | 3.6e-01 | 0.99984 |
-| extracted, window 100, context 25 | 1.8e-01 | 1.4e+00 | 0.99484 |
-| raw path, window 200, context 250 | 5.5e-03 | 8.1e-03 | |
-| raw path, window 200, context 50 | 7.9e-02 | 3.5e-01 | |
-| raw path, window 200, context 0 | 2.5e+00 | 4.5e+00 | |
-
-The window barely matters; the context is what does. Note what that means for
-the `context` setting, because the two things it buys are not the same size. A
-*label* needs only the global window's history, which is 50 frames and is the
-default. A frozen *encoder* wants far more: at 50 frames the raw path is off by
-0.35 on the ASD stream, and at 250 by 0.008. Set `muvap.context` explicitly on
-the raw path; leave it empty on the embedding path, where the encoding already
-happened and only the label history is at stake.
-
-So a cache extracted whole is not bit-identical to a raw run chunked at training
-time, and it is the better-conditioned of the two.
-
-The weights a pack was extracted with are recorded in its `dataset.json` under
-`extracted_by`. Re-extracting is the only way to change them; nothing detects a
-stale cache for you.
-
-## Batching
-
-A batch must agree on its speaker count, for the reason above. Within that,
-`batch_size: 16` is what the paper reports, and the sampler fills batches to it
-inside each speaker bucket. Clearing it falls back to `frame_budget`, which
-groups similar-length chunks to a roughly constant `batch * frames` and holds
-activation memory and the per-frame gradient noise of the mean-reduced losses
-steady in the way a fixed size does not - the same reasoning as the ASD module's
-sampler, which this one reduces to when every conversation has the same number
-of speakers. Either way, `source: media` is far heavier per sample than
-`embeddings`, since the faces have to reach the ASD frontend; size the batch for
-whichever one the run reads.
-
-Segments are cut into **30 s windows overlapping by 10 s** (`train_window: 750`,
-`train_overlap: 250` at 25 Hz), the paper's segmentation, and the grid is built
-at load time rather than written to disk. That is not the slower option: reading
-one window out of a memmapped segment costs 0.92 ms against 8.85 ms for the
-float cast that immediately follows it, while cutting the windows to disk would
-duplicate 44% of the face data, because a 30 s window stepping 20 s stores every
-overlapped frame twice.
-
-Setting `train_overlap: 0` instead tiles the segment into near-equal spans, each
-reading `context` frames of unscored history in front of it - the same history
-without the overlapped frames contributing to the loss twice. Training crops a batch to its
-shortest member, which keeps the model free of a time padding mask. Validation
-and test pad instead and mark the filler unscored, because every frame has to
-survive - for an event, the last frame is the one the prediction is read off.
-
-## Checking the alignment
-
-A shape check cannot tell you a label is a few frames late. This renders one
-packed sample as a self-contained HTML page - audio, face crops, and every
-label stream on one timeline - and reads it *through the dataset*, so what you
-see is what a training step is handed:
-
-```bash
-python tools/render_sample.py --pack /data/AVCC/packed/events.test --index 0 \
-    --output event.html                      # scrub, step, inspect
-python tools/render_sample.py --pack /data/AVCC/packed/segments.val --index 0 \
-    --frames 750 --output window.mp4         # one 30 s training window, with audio
-```
-
-The format follows the extension, and `--start` / `--frames` cut out any span -
-`--frames 750` is exactly one training window. Play it and watch: a mouth should move while that speaker's voice-activity row
-is lit, the per-speaker future bins should light up *before* they start talking,
-and on an event the marked decision frame should sit at the very end with the
-answer still to come. Arrow keys step a frame at a time.
-
-Measured on `diiJlowDHbA/seg13` straight from the real media, the packed sample
-agrees with its sources exactly: voice activity identical to the merged RTTM
-across all 750 speaker-frames, face crops pixel-identical to an independent
-decode of the MP4, audio exactly `frames x 640` samples, and the event's last
-frame within 19 ms of the annotated silence - under one frame, which is
-rounding. Cross-correlating audio energy against the labels over the whole
-segment peaks at **lag 0** and falls off either side, and frames where one
-speaker is the only active one are 6.6-8.3x louder than silence.
 
 ## What it logs
 
