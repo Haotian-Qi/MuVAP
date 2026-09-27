@@ -39,6 +39,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
 from models.muvap import MultiModalVAP, build_frozen_encoders
 from tasks.setup import (
+    LogisticProber,
     get_adamw_optimizer,
     get_cosine_warmup_scheduler,
     get_optimizer_cfg,
@@ -69,9 +70,15 @@ class MuVAPTask(LightningModule):
         )
         self.proj_win = proj_win
         self.test_outputs = []
+        # Set when `muvap.probe` is on: events the logistic probe fits on,
+        # filled from test dataloader 0 and never scored itself.
+        self.probe = bool(cfg["muvap"].get("probe"))
+        self.fit_outputs = []
 
-    def forward(self, vap, asd, speaker_mask=None):
-        return self.model(vap, asd, speaker_mask=speaker_mask)
+    def forward(self, vap, asd, speaker_mask=None, return_embeddings=False):
+        return self.model(
+            vap, asd, speaker_mask=speaker_mask, return_embeddings=return_embeddings
+        )
 
     def streams(self, batch):
         """The two input streams, however this batch happens to carry them."""
@@ -122,10 +129,16 @@ class MuVAPTask(LightningModule):
 
     # -------------------------------------------------------------- evaluation
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx, dataloader_idx=0):
         vap, asd = self.streams(batch)
-        global_logits, speaker_logits = self(vap, asd, batch.get("visual_mask"))
+        global_logits, speaker_logits, global_embedding, _ = self(
+            vap, asd, batch.get("visual_mask"), return_embeddings=True
+        )
         probabilities = speaker_logits.sigmoid()
+        # Dataloader 0 is the probe's fitting pool whenever one is configured;
+        # `MuVAPDataModule.test_dataloader` owns that ordering.
+        fitting = self.probe and dataloader_idx == 0
+        target = self.fit_outputs if fitting else self.test_outputs
 
         # An event is judged at the last frame it was given, which is the last
         # frame before the silence: the answer is still entirely in the future.
@@ -154,9 +167,23 @@ class MuVAPTask(LightningModule):
                 speaker: row
                 for row, speaker in enumerate(metadata["speaker_ids"])
             }
-            self.test_outputs.append(
+            target.append(
                 {
+                    # Carried so a prediction can be joined back to the row of
+                    # the benchmark file it came from.
+                    "sample_id": metadata["sample_id"],
+                    # The row order the two speaker answers index into, so a
+                    # predicted row can be named as the speaker it stands for.
+                    "speaker_ids": list(metadata["speaker_ids"]),
                     "global": global_logits[index, 0, end].float().detach().cpu(),
+                    # The judging frame of the global stream - the same frame
+                    # the codebook readout is taken from, so the probe is an
+                    # upper bound on what that representation carries.
+                    "embedding": global_embedding[index, 0, end]
+                    .float()
+                    .detach()
+                    .cpu()
+                    .numpy(),
                     "label": int("SHIFT" in str(event["label"]).upper()),
                     "previous_pred": int(previous.argmax().item()),
                     "previous_true": rows[event["previous"]],
@@ -173,6 +200,9 @@ class MuVAPTask(LightningModule):
             )
 
     def on_test_epoch_end(self):
+        # Grouped the same way the test events are, so each cell's probe is
+        # fitted on the speaker count it is scored on.
+        fitting = self._conditions(self.fit_outputs) if self.fit_outputs else {}
         for category, samples in self._conditions(self.test_outputs).items():
             global_logits = torch.stack([sample["global"] for sample in samples])
             labels = np.asarray([sample["label"] for sample in samples])
@@ -219,7 +249,39 @@ class MuVAPTask(LightningModule):
                     f"ablation/{category}/f1_macro_scale_{scale}",
                     f1_score(labels, swept, average="macro"),
                 )
+
+            # A linear read of the same frame, fitted on held-out events.
+            # `class_weight="balanced"` puts the boundary where a 50/50 test
+            # set wants it, so a naturally skewed fitting pool needs no
+            # downsampling of its own.
+            pool = fitting.get(category)
+            if pool:
+                probe = LogisticProber().fit_predict(
+                    np.stack([sample["embedding"] for sample in pool]),
+                    np.asarray([sample["label"] for sample in pool]),
+                    np.stack([sample["embedding"] for sample in samples]),
+                )
+                if probe is not None:
+                    self.log(
+                        f"probe/{category}/f1_macro",
+                        f1_score(labels, probe, average="macro"),
+                    )
+                    self.log(
+                        f"probe/{category}/bacc",
+                        balanced_accuracy_score(labels, probe),
+                    )
+        # Per-event records, for scoring that does not belong in the task:
+        # re-keying cells to an external benchmark file, or deriving identity
+        # and hold/shift from one prediction.
+        dump = self.hparams["muvap"].get("dump_predictions")
+        if dump:
+            torch.save({"test": self.test_outputs, "fit": self.fit_outputs}, dump)
+            print(
+                f"wrote {len(self.test_outputs)} test and {len(self.fit_outputs)} "
+                f"fit records to {dump}"
+            )
         self.test_outputs.clear()
+        self.fit_outputs.clear()
 
     @staticmethod
     def _conditioned_next(sample, shift, floor):

@@ -95,6 +95,18 @@ class MuVAPDataModule(LightningDataModule):
             self.test_dataset = PackedConversationDataset(
                 packed["test"], kind=EVENT_KIND
             )
+            # The probe fits on held-out events of the same kind as the test
+            # ones, so it reads the same pack format through the same reader.
+            self.fit_dataset = None
+            if self.cfg["muvap"].get("probe"):
+                if not packed.get("fit"):
+                    raise ValueError(
+                        "muvap.probe is set but packed_muvap.fit names no pack; "
+                        "the probe has nothing to fit on"
+                    )
+                self.fit_dataset = PackedConversationDataset(
+                    packed["fit"], kind=EVENT_KIND
+                )
 
     def _loader(self, dataset, frame_budget, max_batch, shuffle, pad, target=None):
         replicas, rank = self._replicas()
@@ -152,12 +164,35 @@ class MuVAPDataModule(LightningDataModule):
             pad=True,
         )
 
-    def test_dataloader(self):
-        """Turn events, whose windows are already one fixed length."""
+    def fit_dataloader(self):
+        """Turn events the probe fits on - the train split's, not the test's.
+
+        Read exactly as the test events are, because a classifier fitted on one
+        and scored on the other only means anything if the two were built and
+        judged the same way.
+        """
         return self._loader(
+            self.fit_dataset,
+            self.val_frame_budget,
+            self.val_max_batch,
+            shuffle=False,
+            pad=True,
+        )
+
+    def test_dataloader(self):
+        """Turn events, whose windows are already one fixed length.
+
+        With a probe configured this is two loaders, and the order is the
+        contract: index 0 is the pool the probe fits on, index 1 is the
+        benchmark it is scored against. `MuVAPTask.test_step` routes on it.
+        """
+        test = self._loader(
             self.test_dataset,
             self.val_frame_budget,
             self.val_max_batch,
             shuffle=False,
             pad=True,
         )
+        if getattr(self, "fit_dataset", None) is None:
+            return test
+        return [self.fit_dataloader(), test]

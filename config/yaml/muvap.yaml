@@ -15,11 +15,28 @@ packed_muvap:
     - data/AVCC/packed/embeddings.segments.val
   test:
     - data/AVCC/packed/embeddings.events.test
+  # Events the logistic probe fits on, read exactly as the test events are.
+  # The train split's, so nothing the probe sees is ever scored. Only read
+  # when `muvap.probe` is on.
+  fit:
+    - data/AVCC/packed/embeddings.events.train
 
 muvap:
   num_workers: 8
   max_epochs: 5
   seed: 0
+
+  # Fit a logistic regression on the global head's judging frame, using the
+  # `packed_muvap.fit` events, and score it on the test events beside the
+  # zero-shot readout. The gap between the two says how much of what the
+  # representation carries the codebook readout is leaving on the table.
+  probe: false
+
+  # Where to write the per-event test records, or null to write none. Scoring
+  # that belongs to a particular paper table - re-keying the speaker-count
+  # cells to an external benchmark file, or deriving identity and hold/shift
+  # from one prediction - is done from this dump rather than in the task.
+  dump_predictions: null
 
   # embeddings: read what preprocess/muvap/extract.py cached.
   # media: read faces and audio, and run the frozen modules on every batch. That
