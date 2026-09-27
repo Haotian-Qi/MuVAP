@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import (
+    Callback,
     LearningRateMonitor,
     ModelCheckpoint,
     RichProgressBar,
@@ -14,6 +15,21 @@ from data.muvap_dm import MuVAPDataModule
 from models.release import load_weights, merge_config, resolve
 from projection_window import ProjectionWindow
 from tasks.muvap_task import MuVAPTask
+
+
+class BatchSamplerEpoch(Callback):
+    """Advance the train batch sampler's epoch so its shuffle changes.
+
+    Lightning only forwards `set_epoch` to `dataloader.sampler` and
+    `dataloader.batch_sampler.sampler`, so a bare batch sampler never hears
+    about the epoch and would replay one fixed batch order forever.
+    """
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        sampler = getattr(trainer.train_dataloader, "batch_sampler", None)
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(trainer.current_epoch)
 
 
 def parse_args():
@@ -96,6 +112,7 @@ def build_trainer(cfg, logger, checkpoint_dir):
         logger=logger,
         callbacks=[
             *build_checkpoints(muvap_cfg, checkpoint_dir),
+            BatchSamplerEpoch(),
             RichProgressBar(),
             LearningRateMonitor("step"),
         ],

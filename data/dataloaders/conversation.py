@@ -532,8 +532,18 @@ class SpeakerFrameBudgetSampler(Sampler):
         for index, count in enumerate(self.speakers):
             buckets[int(count)].append(index)
 
+        # Seeded by epoch alone, so every rank draws the same batches and then
+        # takes its own slice of them.
+        rng = random.Random(self.seed + self.epoch)
         batches: list[list[int]] = []
         for indices in buckets.values():
+            # Chunks are indexed in segment order, so neighbouring indices are
+            # overlapping windows of one conversation. Shuffling before the
+            # stable length sort keeps equal-length chunks - nearly every full
+            # training window - from always batching with the same neighbours;
+            # the sort still groups short tails for the frame budget.
+            if self.shuffle:
+                rng.shuffle(indices)
             order = sorted(indices, key=lambda index: -self.lengths[index])
             cursor = 0
             while cursor < len(order):
@@ -549,7 +559,6 @@ class SpeakerFrameBudgetSampler(Sampler):
                 batches.append(batch)
 
         if self.shuffle:
-            rng = random.Random(self.seed + self.epoch)
             rng.shuffle(batches)
         if self.num_replicas > 1:
             # Every rank must run the same number of steps or DDP deadlocks.
